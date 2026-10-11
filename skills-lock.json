@@ -1,0 +1,23 @@
+{
+  "version": 1,
+  "skills": {
+    "125-java-concurrency": {
+      "source": "jabrena/plinth",
+      "sourceType": "github",
+      "skillPath": "skills/125-java-concurrency/SKILL.md",
+      "computedHash": "51b05fdaabb9dce836025aa2601138d25b077fc420d286cf77393b8f3bf88429"
+    },
+    "ataopro-alibaba-java-coding-guidelines": {
+      "source": "ataopro/ataopro-alibaba-java-coding-guidelines",
+      "sourceType": "github",
+      "skillPath": "SKILL.md",
+      "computedHash": "7ac09bb155e0cf5d25b8106d67565432ff06e5534007420faf2b041197b18dca"
+    },
+    "java-coding-standards": {
+      "source": "affaan-m/ecc",
+      "sourceType": "github",
+      "skillPath": "skills/java-coding-standards/SKILL.md",
+      "computedHash": "c45cf8f0b87d44804e582fe0d103e154214961bcae4c5e1cb473d2f20d529096"
+    }
+  }
+}

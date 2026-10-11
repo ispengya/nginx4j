@@ -1,0 +1,22 @@
+# ---------- build output ----------
+target/
+*.class
+
+# ---------- IDE ----------
+.idea/
+*.iml
+.vscode/
+*.swp
+
+# ---------- skills installer ----------
+# npm/scratch space used while installing project skills.
+.tmp-npm-cache/
+# The junctions under .claude/skills are Windows reparse points carrying absolute
+# D:\... targets; they are regenerated from .agents/skills + skills-lock.json.
+.claude/skills/
+.claude/settings.local.json
+
+# ---------- runtime noise ----------
+*.log
+hs_err_pid*.log
+replay_pid*.log

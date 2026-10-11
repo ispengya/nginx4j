@@ -1,0 +1,23 @@
+body {
+  margin: 3rem auto;
+  max-width: 40rem;
+  font-family: system-ui, "Segoe UI", "Microsoft YaHei", sans-serif;
+  line-height: 1.7;
+  color: #1f2328;
+}
+
+h1 {
+  font-size: 1.6rem;
+  margin-bottom: 0.5rem;
+}
+
+code {
+  background: #f2f3f5;
+  padding: 0.1rem 0.3rem;
+  border-radius: 3px;
+}
+
+.hint {
+  color: #57606a;
+  font-size: 0.9rem;
+}
