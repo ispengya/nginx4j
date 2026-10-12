@@ -1,5 +1,6 @@
 package com.ispengya.nginx4j.server;
 
+import com.ispengya.nginx4j.router.Router;
 import io.netty.channel.ChannelInitializer;
 import io.netty.channel.ChannelPipeline;
 import io.netty.channel.socket.SocketChannel;
@@ -17,13 +18,16 @@ import io.netty.handler.stream.ChunkedWriteHandler;
  * <p>{@code HttpServerKeepAliveHandler} only implements the {@code Connection} header semantics here;
  * the inter-request idle timeout is owned by the content handler, which starts its clock once a
  * response has been written.
+ *
+ * <p>The router is built once per server and shared by every channel: it is immutable, and its
+ * compiled patterns are safe to use from several EventLoops.
  */
 public final class HttpServerInitializer extends ChannelInitializer<SocketChannel> {
 
-    private final ServerOptions options;
+    private final Router router;
 
     public HttpServerInitializer(ServerOptions options) {
-        this.options = options;
+        this.router = Router.of(options.http());
     }
 
     @Override
@@ -32,7 +36,6 @@ public final class HttpServerInitializer extends ChannelInitializer<SocketChanne
         pipeline.addLast("http-codec", new HttpServerCodec());
         pipeline.addLast("keep-alive", new HttpServerKeepAliveHandler());
         pipeline.addLast("chunked-writer", new ChunkedWriteHandler());
-        pipeline.addLast("static-file", new StaticFileHandler(options.root(), options.indexFiles(),
-                options.autoIndex(), options.keepAliveTimeoutSeconds()));
+        pipeline.addLast("static-file", new StaticFileHandler(router));
     }
 }
