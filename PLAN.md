@@ -17,7 +17,7 @@
 |---|---|---|---|
 | M0 | pom + Main + 线程模型接线 + 最小静态文件服务 | `curl :8080` 返回文件且长度/哈希一致 | ☑ |
 | M1 | 静态文件补全：Range(206/416)、ETag/If-None-Match/If-Modified-Since/If-Range、目录 301、autoindex、index 可配置 | `mvn test` 33 个用例全绿；curl 逐个头/字节核对 | ☑ |
-| M2 | conf 子集解析 + server/location 路由（优先级照抄 nginx：`=` → `^~` → 最长前缀 → `~` 正则） | 优先级用例表全绿 | ☐ |
+| M2 | conf 子集解析 + server/location 路由（优先级照抄 nginx：`=` → `^~` → 最长前缀 → `~` 正则） | 优先级用例表全绿 | ☑ |
 | M3 | 反代核心：UpstreamPool、头部改写、流式响应泵、RR+weight、三段超时 | 代理到 Jetty demo；SSE 边收边到；大下载期间堆平稳 | ☐ |
 | M4 | 弹性：失败重试、被动健康检查、least_conn/ip_hash、draining 停机 | kill -9 后端无 502 风暴；重启不断流 | ☐ |
 | M5 | 增强：TLS/SNI、gzip、limit_req、access_log、WebSocket 隧道 | wss 聊天穿透代理 | ☐ |
@@ -164,6 +164,20 @@ curl.exe -sS -D - -o NUL http://localhost:8080/index.html             # 取 ETag
   实测发现并修复：请求尾部 `LastHttpContent` 会误清 keep-alive 计时器（见第 5 节第 9 条）。
 - 约定：每个里程碑小步提交，提交信息如 `M3: implement streaming proxy pump`；
   新需求先更新本文件再实现；机械性规则交给编译器/工具，不靠自觉。
+- M2 验收（2026-10-12，JDK 1.8.0_351）：`mvn -B clean package` 通过，67 个用例全绿
+  （`ConfParserTest` 18 + `RouterTest` 6 + `ConfIntegrationTest` 8 + `StaticFileHandlerTest` 18
+  + `HttpServerIntegrationTest` 7 + `ServerOptionsTest` 10），比 M1 的 33 个翻倍。
+  用真实 conf（`-c`，单端口两个 server + 两个 location）起服务逐项核对：
+  `Host: a.example.com` → `A-INDEX`、`Host: b.example.com` → `B-INDEX`、未匹配 Host 回落第一个 server；
+  `/only-a.txt` 在 a 为 200、在 b 为 404（root 确实按 server 分开）；
+  `location /assets/ { root ...; }` 覆盖 root 后 200、`location = /exact.txt` 200；
+  HEAD 无 body、`Range: bytes=0-3` → 206 `bytes 0-3/6` 且内容为前 4 字节、POST → 405；
+  启动日志逐条打印 conf 路径、监听地址与每个 server 的名字/root/default_server 标记。
+  错误路径同样核对：`-c` 与 `--port` 互斥报错、坏 conf 报
+  `broken.conf:3:26: 'location' requires a '{ ... }' block`，两者均以 exit=2 退出。
+  实测发现并修复：`root` 的语义是 **root + 完整 URI**，`location /assets/ { root X; }` 不会把
+  location 前缀从路径里剥掉（`alias` 才那样，已推迟到 P2）—— 集成用例最初按错误理解摆文件，
+  现已把这条写进 8.1 节。
 
 ## 8. M2 实施设计（conf 子集 + 路由）
 
