@@ -2,6 +2,7 @@ package com.ispengya.nginx4j.server;
 
 import org.junit.Test;
 
+import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.Collections;
 
@@ -82,6 +83,51 @@ public class ServerOptionsTest {
     @Test
     public void missingRootDirectoryFailsFast() {
         assertRejected(new String[] {"--root", "definitely-not-a-directory"}, "--root");
+    }
+
+    @Test
+    public void configurationFileOwnsTheValuesTheCommandLineWouldOtherwiseSet() throws Exception {
+        Path confFile = writeConf("http {\n"
+                + "  keepalive_timeout 5s;\n"
+                + "  server { listen 0; server_name a.com; root " + slashTempDir() + "; }\n"
+                + "}\n");
+
+        ServerOptions options = ServerOptions.parse(new String[] {
+                "-c", confFile.toString(), "--worker-threads", "3"});
+
+        assertEquals(0, options.port());
+        assertEquals(3, options.workerThreads());
+        assertEquals(5, options.keepAliveTimeoutSeconds());
+        assertEquals(confFile.toAbsolutePath().normalize(), options.confFile());
+        assertEquals(1, options.http().servers().size());
+
+        assertRejected(new String[] {"-c", confFile.toString(), "--port", "9090"}, "--port");
+        assertRejected(new String[] {"-c", confFile.toString(), "--root", "."}, "--root");
+        assertRejected(new String[] {"-c", confFile.toString(), "--index", "a.html"}, "--index");
+        assertRejected(new String[] {"-c", confFile.toString(), "--autoindex", "on"}, "--autoindex");
+        assertRejected(new String[] {"-c", confFile.toString(), "--keep-alive-timeout", "9"},
+                "--keep-alive-timeout");
+    }
+
+    @Test
+    public void unreadableOrRootlessConfigurationFilesFailFast() throws Exception {
+        assertRejected(new String[] {"-c", "definitely-not-a.conf"},
+                "cannot read configuration file");
+
+        Path confFile = writeConf("http {\n  root /definitely/not/here;\n  server { listen 0; }\n}\n");
+        assertRejected(new String[] {"-c", confFile.toString()}, "does not exist");
+    }
+
+    private static Path writeConf(String content) throws java.io.IOException {
+        Path directory = java.nio.file.Files.createTempDirectory("nginx4j-options");
+        Path confFile = directory.resolve("nginx.conf");
+        java.nio.file.Files.write(confFile, content.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+        return confFile;
+    }
+
+    private static String slashTempDir() throws java.io.IOException {
+        return java.nio.file.Files.createTempDirectory("nginx4j-root").toAbsolutePath()
+                .toString().replace('\\', '/');
     }
 
     private static void assertRejected(String[] args, String expectedToken) {
