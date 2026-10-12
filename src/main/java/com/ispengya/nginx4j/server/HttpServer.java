@@ -1,5 +1,6 @@
 package com.ispengya.nginx4j.server;
 
+import com.ispengya.nginx4j.conf.ServerBlock;
 import io.netty.bootstrap.ServerBootstrap;
 import io.netty.channel.Channel;
 import io.netty.channel.ChannelOption;
@@ -58,7 +59,7 @@ public final class HttpServer {
                     .option(ChannelOption.SO_REUSEADDR, true)
                     .childOption(ChannelOption.TCP_NODELAY, true)
                     .childHandler(new HttpServerInitializer(options));
-            serverChannel = bootstrap.bind(options.port()).sync().channel();
+            serverChannel = bootstrap.bind(bindAddress()).sync().channel();
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             stop();
@@ -125,11 +126,33 @@ public final class HttpServer {
         LOG.info("nginx4j stopped");
     }
 
+    private InetSocketAddress bindAddress() {
+        return options.host() == null
+                ? new InetSocketAddress(options.port())
+                : new InetSocketAddress(options.host(), options.port());
+    }
+
     private void logStartup() {
         LOG.info(String.format(
-                "nginx4j listening%n  listen     : %d%n  root       : %s%n  boss       : %d thread%n"
-                        + "  worker     : %d EventLoop (availableProcessors=%d)%n  keep-alive : %d s",
-                port(), options.root(), BOSS_THREADS, options.workerThreads(),
-                Runtime.getRuntime().availableProcessors(), options.keepAliveTimeoutSeconds()));
+                "nginx4j listening%n  conf       : %s%n  listen     : %s%n  boss       : %d thread%n"
+                        + "  worker     : %d EventLoop (availableProcessors=%d)%n  servers    : %s",
+                options.confFile() == null ? "(command line)" : options.confFile().toString(),
+                (options.host() == null ? "*" : options.host()) + ":" + port(), BOSS_THREADS,
+                options.workerThreads(), Runtime.getRuntime().availableProcessors(),
+                describeServers()));
+    }
+
+    /** One line per virtual server, so the startup log shows what was actually configured. */
+    private String describeServers() {
+        StringBuilder text = new StringBuilder();
+        for (ServerBlock server : options.http().servers()) {
+            if (text.length() > 0) {
+                text.append(System.lineSeparator()).append("               ");
+            }
+            text.append(server.describeNames()).append(" -> ").append(server.root())
+                    .append(" (").append(server.locations().size()).append(" location)")
+                    .append(server.isDefaultServer() ? " [default_server]" : "");
+        }
+        return text.toString();
     }
 }

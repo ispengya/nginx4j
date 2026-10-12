@@ -350,8 +350,8 @@ public final class ConfParser {
             if ("::".equals(literal)) {
                 host = null;
             } else {
-                // Keep the brackets: InetSocketAddress accepts "[::1]" as a host name for binding.
-                host = value.substring(0, closing + 1);
+                // Store the bare literal: InetSocketAddress accepts "::1" for a local bind.
+                host = literal;
             }
         } else if (value.indexOf(':') < 0) {
             if (isAllDigits(value)) {
