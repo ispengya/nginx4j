@@ -187,6 +187,8 @@ curl.exe -sS -D - -o NUL http://localhost:8080/index.html             # 取 ETag
 - `location`：支持 `=`、`^~`、`~`、`~*` 与无修饰前缀；**不支持** `@named`、嵌套 location、
   `alias`、`try_files`、正则捕获组变量 —— 命中即报错说明推迟到哪个里程碑。
 - 相对 `root` 相对 **conf 文件所在目录**解析（CLI 路径相对 cwd，行为不变）。
+- `root` 采用 nginx 语义：**磁盘路径 = root + 完整 URI**（不是 location 前缀之后的部分）；
+  `location /assets/ { root /srv; }` 请求 `/assets/a.css` 命中 `/srv/assets/a.css`。`alias` 推迟到 P2。
 - `-c/--conf` 与 `--port/--root/--index/--autoindex/--keep-alive-timeout` **互斥**（报错，杜绝两套真值）；
   `--worker-threads` 仍可覆盖 conf 里的 `worker_processes`。
 - **M2 只支持单一监听端口**：所有 server 的 listen 端口必须相同，否则报错。跨端口/多地址绑定推迟。
