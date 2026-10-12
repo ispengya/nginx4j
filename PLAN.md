@@ -164,3 +164,56 @@ curl.exe -sS -D - -o NUL http://localhost:8080/index.html             # 取 ETag
   实测发现并修复：请求尾部 `LastHttpContent` 会误清 keep-alive 计时器（见第 5 节第 9 条）。
 - 约定：每个里程碑小步提交，提交信息如 `M3: implement streaming proxy pump`；
   新需求先更新本文件再实现；机械性规则交给编译器/工具，不靠自觉。
+
+## 8. M2 实施设计（conf 子集 + 路由）
+
+### 8.1 支持的指令子集（表外的指令一律**报错**，不静默忽略）
+
+| 上下文 | 指令 |
+|---|---|
+| main | `worker_processes <n\|auto>`、`events { }`、`http { }` |
+| events | `worker_connections <n>`（解析+校验，M6 调优时才生效） |
+| http | `keepalive_timeout <time> [header_timeout]`、`root`、`index`、`autoindex`、`server { }` |
+| server | `listen`、`server_name`、`root`、`index`、`autoindex`、`keepalive_timeout`、`location { }` |
+| location | `root`、`index`、`autoindex`、`keepalive_timeout` |
+
+- 词法：`#` 至行尾为注释；`{` `}` `;` 是结构符；单/双引号可包裹含空白与结构符的 token；
+  含 `$` 的 token 直接报错（变量是 M5/P2 的事）。错误信息必须带 `文件名:行:列`。
+- 时间：后缀 `ms/s/m/h/d`，无后缀按秒。`keepalive_timeout` 第二个值（header timeout）接受但暂不使用。
+- `listen`：`PORT` / `ADDR:PORT` / `[v6]:PORT`，可带 `default_server`（或 `default`）标志；
+  `ssl`/`http2` 等其余参数报错并指明是 M5 范围。
+- `server_name`：精确名、`*.example.com`、`mail.*`、`.example.com`（展开为精确名 + `*.` 通配）、
+  `~regex`、`""`；`_` 按 catch-all 处理。
+- `location`：支持 `=`、`^~`、`~`、`~*` 与无修饰前缀；**不支持** `@named`、嵌套 location、
+  `alias`、`try_files`、正则捕获组变量 —— 命中即报错说明推迟到哪个里程碑。
+- 相对 `root` 相对 **conf 文件所在目录**解析（CLI 路径相对 cwd，行为不变）。
+- `-c/--conf` 与 `--port/--root/--index/--autoindex/--keep-alive-timeout` **互斥**（报错，杜绝两套真值）；
+  `--worker-threads` 仍可覆盖 conf 里的 `worker_processes`。
+- **M2 只支持单一监听端口**：所有 server 的 listen 端口必须相同，否则报错。跨端口/多地址绑定推迟。
+
+### 8.2 继承与不可变性
+
+`keepalive_timeout`、`root`、`index`、`autoindex` 沿 http → server → location 继承，
+但**在解析期就折叠进各个 Block**：运行时读到的都是最终值，不存在"向上找父级"的逻辑，也不会有继承 bug。
+解析产物全部不可变，天然就是 M5 平滑 reload 要原子替换的那份快照。
+
+### 8.3 路由算法（照抄 nginx 优先级）
+
+- server 选择：精确名 → 最长 `*.x` 通配 → 最长 `x.*` 通配 → 配置顺序第一个命中的正则 → 默认 server
+  （带 `default_server` 的，没有就是该端口第一个 server）。
+- location 选择：`=` 精确命中即返回；否则取最长前缀匹配并记下它是否 `^~`，是 `^~` 就直接返回；
+  否则按配置顺序试正则，首个命中即返回；否则回落到那个最长前缀；一个前缀都没有就用 server 级默认值。
+- Host 处理：去掉 `:port`、转小写、去尾部 `.`；缺失或匹配不上走默认 server。
+- URI 用原始 path 匹配（M2 不做 `%XX` 解码与 `//` 归一化，与 nginx 的差异记在第 5 节坑清单）；
+  穿越防护仍由"解析后路径必须落在 root 之内"兜底，不受影响。
+
+### 8.4 测试表
+
+| 层 | 文件 | 覆盖 |
+|---|---|---|
+| L1 | `ConfParserTest` | 完整合法 conf 解析、继承折叠、时间/引号/注释、每条错误路径（漏分号、未知指令、重复、非法正则、嵌套 location、含 `$`、多端口、listen 参数）均断言行列号 |
+| L1 | `RouterTest` | server_name 五档优先级 + Host 去端口/大小写/尾点；location 五档优先级（`=` 短路、`^~` 压过正则、正则按序、最长前缀、无匹配回落 server 默认） |
+| L1 | `StaticFileHandlerTest` | 原 18 个用例**不改**（4 参数构造器保留为"无 conf 的单 server"便捷路径） |
+| L2 | `ConfIntegrationTest` | `--port 0` + 临时 conf 起真实服务：按 Host 分两个 server 各自 root、location 覆盖 root、`=`/正则/前缀各返回预期内容、conf 里的 keepalive 生效 |
+
+验收：`mvn -B test` 全绿（M1 的 33 个用例 + M2 新增），L2 至少覆盖"同一端口两个 Host 分流到不同 root"。
