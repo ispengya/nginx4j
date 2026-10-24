@@ -70,7 +70,7 @@ java -jar target/nginx4j-0.1.0-SNAPSHOT.jar -c nginx.conf
 - `root` 是相对 **conf 文件所在目录** 解析的；上面的配置假设 `nginx.conf` 就在仓库根目录。
 - `-c` 与 `--port`、`--root`、`--index`、`--autoindex`、`--keep-alive-timeout` 互斥，避免两套真值。
 - `proxy_pass` 只允许写在 `location` 里；`upstream` 只允许写在 `http` 里。
-- M3 的 `proxy_pass` 不支持带 URI 的写法（前缀替换），原请求路径会原样转发给上游。
+- `proxy_pass` 目前不支持带 URI 的写法（前缀替换），原请求路径会原样转发给上游。
 - 上游主机在配置解析期完成 DNS 解析，运行期不再查 DNS。
 - 示例里的 `127.0.0.1:9000`、`127.0.0.1:9001` 需要先有可用的上游服务，否则代理会返回 502。
 
