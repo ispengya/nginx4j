@@ -31,7 +31,7 @@ Java 实现的轻量级 nginx：静态文件 + 反向代理 + 负载均衡。技
 
 ## 当前状态
 
-M0、M1、M2 已完成并通过验收（证据见 PLAN.md 第 7 节）：
+M0–M3 已完成并通过验收（证据见 PLAN.md 第 7 节）：
 
 - 骨架：pom（JDK8 + `netty-all` 4.1.119 + JUnit4）、`Main`、`ServerOptions`、
   `HttpServer`（boss 1 / worker = 核数，`start()/port()/stop()` 可测生命周期）。
@@ -42,13 +42,14 @@ M0、M1、M2 已完成并通过验收（证据见 PLAN.md 第 7 节）：
   （精确 → 最长 `*.x` → 最长 `x.*` → 首个正则 → 默认 server）与 location
   （`=` → 最长前缀，`^~` 短路正则 → 正则按序 → 回落到最长前缀）。M2 只支持单一监听端口。
   支持的指令表见 PLAN.md 8.1 节，**加指令前先更新那张表**。
-- 测试：67 个用例全绿（`ConfParserTest` 18 + `RouterTest` 6 + `ConfIntegrationTest` 8 +
-  `StaticFileHandlerTest` 18 + `HttpServerIntegrationTest` 7 + `ServerOptionsTest` 10），
-  `mvn -B test` 一条命令跑完单测与集成测试。
+- 反向代理（M3）：`upstream` / `proxy_pass` / `proxy_set_header` / 三段超时已解析并接线；
+  请求与响应头清洗（含 `Connection` 点名的扩展跳头）、流式双向泵、双向背压、
+  RR + weight 平滑加权轮询（per-EventLoop 游标）、502/504 映射；
+  上游连接一请求一条、响应结束即关，前后端严格同 EventLoop；代理与静态路径共用 keep-alive 计时器。
+- 测试：94 个用例（1 个可选 256MB 慢读 soak 默认跳过），
+  `mvn -B test` 一条命令跑完单测与集成测试；soak 命令见 PLAN.md 第 7 节。
 
-M3 第 1 步（配置解析）已完成：`upstream`、`proxy_pass`、`proxy_set_header` 与三条
-`proxy_*_timeout` 已解析进 `UpstreamBlock` / `ProxyTarget`，上游主机在解析期完成 DNS 解析；
-`proxy_http_version` 与上游连接复用推迟到 M4。**运行时转发尚未接线**，带 `proxy_pass` 的
-location 目前仍按静态路径处理，这个中间状态不要用于对外服务。
+当前边界（M4 范围）：上游连接池与 `proxy_http_version`、失败重试、被动健康检查、
+`least_conn` / `ip_hash`、draining 停机都未实现；M3 的 `upstream` 只支持 `server` + `weight`。
 
-下一步：M3 第 2 步（请求/响应头改写），然后是最小竖切（同 EventLoop + 流式泵 + 背压）。
+下一步：M4 弹性与复用（连接池 keepalive、重试、健康检查、更多 LB 算法、draining）。

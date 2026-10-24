@@ -29,7 +29,6 @@ import io.netty.handler.codec.http.LastHttpContent;
 import io.netty.handler.codec.http.QueryStringDecoder;
 import io.netty.util.CharsetUtil;
 import io.netty.util.ReferenceCountUtil;
-import io.netty.util.concurrent.ScheduledFuture;
 
 import java.io.IOException;
 import java.nio.file.Files;
@@ -37,7 +36,6 @@ import java.nio.file.InvalidPathException;
 import java.nio.file.Path;
 import java.util.Date;
 import java.util.List;
-import java.util.concurrent.TimeUnit;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 
@@ -47,13 +45,13 @@ import java.util.logging.Logger;
  * <p>Implements the nginx static-content semantics for this project's scope: GET/HEAD, the
  * {@code index} directive, directory redirect and {@code autoindex}, zero-copy body transfers,
  * {@code Range} requests (206/416), conditional requests (ETag, Last-Modified, If-Range) and
- * keep-alive with an inter-request idle timeout. From M2 on, {@code root}, {@code index},
- * {@code autoindex} and {@code keepalive_timeout} all come from the matched server/location, whose
- * inheritance was already resolved by the configuration parser.
+ * keep-alive. From M2 on, {@code root}, {@code index}, {@code autoindex} and
+ * {@code keepalive_timeout} all come from the matched server/location, whose inheritance was
+ * already resolved by the configuration parser.
  *
- * <p>One instance is created per channel by {@link HttpServerInitializer}; the immutable
- * {@link Router} is shared by every channel, and the frozen threading model (one thread per
- * EventLoop) is the only synchronization the timer field needs.
+ * <p>{@link RequestDispatcher} owns routing in the server pipeline and calls {@link #handle}; the
+ * handler's own {@link #channelRead} path remains for the handler-level tests. The inter-request
+ * idle clock lives in {@link IdleTimeoutHandler}, shared with the reverse proxy path.
  */
 public final class StaticFileHandler extends ChannelInboundHandlerAdapter {
 
@@ -62,7 +60,6 @@ public final class StaticFileHandler extends ChannelInboundHandlerAdapter {
     private static final String HTML_UTF8 = "text/html; charset=utf-8";
 
     private final Router router;
-    private ScheduledFuture<?> keepAliveTimeout;
 
     public StaticFileHandler(Router router) {
         this.router = router;
@@ -89,27 +86,24 @@ public final class StaticFileHandler extends ChannelInboundHandlerAdapter {
             ReferenceCountUtil.release(msg);
             return;
         }
-        // A new request arrived, so the connection is in use again.
-        cancelKeepAliveTimeout();
         try {
-            handleRequest(ctx, (HttpRequest) msg);
+            HttpRequest request = (HttpRequest) msg;
+            ResolvedLocation location = router.route(request.headers().get(HttpHeaderNames.HOST),
+                    requestPath(request.uri()));
+            handle(ctx, request, location);
         } finally {
             ReferenceCountUtil.release(msg);
         }
     }
 
-    @Override
-    public void channelInactive(ChannelHandlerContext ctx) throws Exception {
-        cancelKeepAliveTimeout();
-        super.channelInactive(ctx);
-    }
-
-    private void handleRequest(ChannelHandlerContext ctx, HttpRequest request) {
-        // Routing comes first: every reply, including an error reply, has to carry the keep-alive
-        // timeout of the location that owns the request.
-        ResolvedLocation location = router.route(request.headers().get(HttpHeaderNames.HOST),
-                requestPath(request.uri()));
-
+    /**
+     * Serves one request whose location the caller has already resolved.
+     *
+     * <p>{@link RequestDispatcher} calls this directly so that the routing decision is made once;
+     * the {@link #channelRead} path above is kept for the handler-level tests and for any embedded
+     * use of this handler on its own.
+     */
+    void handle(ChannelHandlerContext ctx, HttpRequest request, ResolvedLocation location) {
         if (!isGetOrHead(request)) {
             // An unread request body would corrupt the next request on this connection: always close.
             writeError(ctx, request, HttpResponseStatus.METHOD_NOT_ALLOWED, false, location);
@@ -354,28 +348,10 @@ public final class StaticFileHandler extends ChannelInboundHandlerAdapter {
     }
 
     /**
-     * Starts the keep-alive idle timer once a response has been written. Like nginx's
+     * Starts the shared keep-alive clock once a response has been written. Like nginx's
      * {@code keepalive_timeout}, which may be set per location, the clock only runs between
      * requests, so a slow download is never killed mid-transfer.
      */
-    private void scheduleKeepAliveTimeout(final ChannelHandlerContext ctx, long keepAliveTimeoutMillis) {
-        keepAliveTimeout = ctx.executor().schedule(() -> {
-            if (ctx.channel().isActive()) {
-                if (LOG.isLoggable(Level.FINE)) {
-                    LOG.fine("keep-alive timeout, closing " + ctx.channel().remoteAddress());
-                }
-                ctx.close();
-            }
-        }, keepAliveTimeoutMillis, TimeUnit.MILLISECONDS);
-    }
-
-    private void cancelKeepAliveTimeout() {
-        if (keepAliveTimeout != null) {
-            keepAliveTimeout.cancel(false);
-            keepAliveTimeout = null;
-        }
-    }
-
     private void completeResponse(ChannelHandlerContext ctx, ChannelFuture lastWrite,
             boolean keepAlive, long keepAliveTimeoutMillis) {
         final long timeoutMillis = keepAliveTimeoutMillis;
@@ -386,7 +362,7 @@ public final class StaticFileHandler extends ChannelInboundHandlerAdapter {
                 return;
             }
             if (keepAlive) {
-                scheduleKeepAliveTimeout(ctx, timeoutMillis);
+                IdleTimeoutHandler.startKeepAliveTimeout(ctx, timeoutMillis);
             }
         });
     }

@@ -18,7 +18,7 @@
 | M0 | pom + Main + 线程模型接线 + 最小静态文件服务 | `curl :8080` 返回文件且长度/哈希一致 | ☑ |
 | M1 | 静态文件补全：Range(206/416)、ETag/If-None-Match/If-Modified-Since/If-Range、目录 301、autoindex、index 可配置 | `mvn test` 33 个用例全绿；curl 逐个头/字节核对 | ☑ |
 | M2 | conf 子集解析 + server/location 路由（优先级照抄 nginx：`=` → `^~` → 最长前缀 → `~` 正则） | 优先级用例表全绿 | ☑ |
-| M3 | 反代核心：头部改写、流式响应泵、RR+weight、三段超时 | 代理到 Jetty demo；SSE 边收边到；大下载期间堆平稳 | ☐ 1/6：配置解析完成 |
+| M3 | 反代核心：头部改写、流式响应泵、RR+weight、三段超时 | mock 上游转发；SSE 边收边到；256MB 慢读/128MB 堆无 OOM | ☑ |
 | M4 | 弹性与复用：失败重试、被动健康检查、上游连接池 keepalive（含 `proxy_http_version`）、least_conn/ip_hash、draining 停机 | kill -9 后端无 502 风暴；重启不断流 | ☐ |
 | M5 | 增强：TLS/SNI、gzip、limit_req、access_log、WebSocket 隧道 | wss 聊天穿透代理 | ☐ |
 | M6 | 压测调优：泄漏检测跑全场景、水位/池参数、与 nginx 的 wrk 对比报告 | 报告存档 | ☐ |
@@ -178,6 +178,20 @@ curl.exe -sS -D - -o NUL http://localhost:8080/index.html             # 取 ETag
   实测发现并修复：`root` 的语义是 **root + 完整 URI**，`location /assets/ { root X; }` 不会把
   location 前缀从路径里剥掉（`alias` 才那样，已推迟到 P2）—— 集成用例最初按错误理解摆文件，
   现已把这条写进 8.1 节。
+- M3 验收（2026-10-24，JDK 1.8.0_351）：`mvn -B clean package` 通过，94 个用例
+  （1 个可选 soak 默认跳过，单独跑通）。代理自动验收 12 个用例覆盖：hello 转发、
+  请求头重写（Host / X-Forwarded-For / Connection 点名的扩展跳头清洗）、响应跳头清洗、
+  SSE 首块在上游阻塞时先到、同一客户端连接两次请求对应两条上游连接、上游无响应关闭 → 502、
+  读超时 → 504、2MB 二进制逐字节一致、POST body 流式转发、静态与代理共存、代理连接空闲超时。
+  背压验收：256MB 响应 + 裸 socket 每 64KB 睡 1ms 慢读，在 `-Xmx128m`（小于响应体，
+  若整包缓冲必然 OOM）+ `-Dio.netty.leakDetection.level=PARANOID` 下 7.9s 跑完，
+  无 OOM、无 LEAK 日志。命令：
+  `mvn -B test -Dtest='ProxyIntegrationTest#slowClientBackpressureSoak' -Dnginx4j.soak=true -DargLine='-Xmx128m -Dio.netty.leakDetection.level=PARANOID'`。
+  测试床使用内置裸 socket mock upstream（`/hello`、`/headers`、`/hop`、`/sse`、`/big`、`/soak`、
+  `/close`、`/hang`），未新增 Jetty demo；9.7/9.8 中的 Jetty + curl 清单保留为可选手工验收。
+  实测发现并修复：`IdleStateHandler` 的三个参数是 reader/writer/all，读超时必须放在第一个，
+  否则 `proxy_read_timeout` 会静默失效；旧上游连接迟到的关闭/可写事件通过事务归属校验隔离，
+  不会误伤同一客户端上的下一笔请求。
 
 ## 8. M2 实施设计（conf 子集 + 路由）
 
@@ -192,9 +206,8 @@ curl.exe -sS -D - -o NUL http://localhost:8080/index.html             # 取 ETag
 | location | `root`、`index`、`autoindex`、`keepalive_timeout`、`proxy_pass <http://host[:port] \| http://upstream_name>`、`proxy_set_header`、三条 `proxy_*_timeout` |
 | upstream | `server ADDR[:PORT] [weight=N]` |
 
-> **M3 进度**：反代指令已由 M3 第 1 步解析进配置模型（`UpstreamBlock` / `ProxyTarget`），
-> 但**运行时转发尚未接线**（M3 第 3 步）。接线前带 `proxy_pass` 的 location 仍按静态路径处理，
-> 该中间状态不要用于对外服务。
+> **M3 状态**：表内反代指令已全部解析并接入运行时。`upstream` 只允许写在 http，
+> `proxy_pass` 只允许写在 location；上游主机在解析期完成 DNS 解析（M3-D3）。
 >
 > **M3 推迟项**：`proxy_http_version` 与上游连接复用（`keepalive`）一起推到 **M4**；
 > M3 恒为"一请求一条上游连接、用完即关"（见 9.2 与 9.6 的 M3-D5）。
@@ -386,7 +399,8 @@ curl.exe -sS -D - -o NUL http://localhost:8080/index.html             # 取 ETag
 | M3-D6 | `proxy_next_upstream` | 从 `plannedMilestone` 的 "M3 reverse proxy" **改到 M4**（重试属 M4 弹性范围），M3 仍拒绝；`ConfParserTest` 的提示断言同步改 |
 | M3-D7 | 静态路径重构幅度 | 保留 `StaticFileHandler` 的响应逻辑与 4 参数测试构造器，只把"路由"与"计时器"两个职责上移到 `RequestDispatcher`/`IdleTimeoutHandler` |
 
-**状态：M3-D1…D7 已于 2026-10-13 定稿（M3-D5 复审后改为"推迟到 M4"），第 9 节即实现依据。** 代码不得偏离本表；
+**状态：M3-D1…D7 已于 2026-10-13 定稿（M3-D5 复审后改为"推迟到 M4"），第 9 节即实现依据；
+M3 已于 2026-10-24 按本节完成并通过验收（见第 7 节）。** 代码不得偏离本表；
 确实需要偏离时，先改这一行再改代码（与 8.1 节的指令表同一套纪律）。8.1 表继续保留带 `（**M3**）` 的行作为唯一定义处，
 不另开第二张增量表。
 

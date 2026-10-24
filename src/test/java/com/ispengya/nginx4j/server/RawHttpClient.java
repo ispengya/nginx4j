@@ -17,7 +17,7 @@ import java.util.Map;
  * <p>Raw sockets are deliberate: the JDK clients refuse to let a test set the {@code Host} header,
  * and virtual-host routing is exactly what these tests need to exercise.
  */
-final class RawHttpClient {
+public final class RawHttpClient {
 
     private static final int CONNECT_TIMEOUT_MILLIS = 5000;
     private static final int READ_TIMEOUT_MILLIS = 10_000;
@@ -26,7 +26,7 @@ final class RawHttpClient {
     }
 
     /** Sends {@code GET path} with an explicit {@code Host} header and reads the response. */
-    static Response get(int port, String host, String path, String... extraHeaders) throws IOException {
+    public static Response get(int port, String host, String path, String... extraHeaders) throws IOException {
         StringBuilder request = new StringBuilder();
         request.append("GET ").append(path).append(" HTTP/1.1\r\n");
         request.append("Host: ").append(host).append("\r\n");
@@ -38,7 +38,7 @@ final class RawHttpClient {
     }
 
     /** Sends a verbatim request, for keep-alive tests that need one socket across two requests. */
-    static Response send(int port, String rawRequest) throws IOException {
+    public static Response send(int port, String rawRequest) throws IOException {
         try (Socket socket = connect(port)) {
             OutputStream out = socket.getOutputStream();
             out.write(rawRequest.getBytes(StandardCharsets.US_ASCII));
@@ -47,14 +47,14 @@ final class RawHttpClient {
         }
     }
 
-    static Socket connect(int port) throws IOException {
+    public static Socket connect(int port) throws IOException {
         Socket socket = new Socket();
         socket.connect(new InetSocketAddress("127.0.0.1", port), CONNECT_TIMEOUT_MILLIS);
         socket.setSoTimeout(READ_TIMEOUT_MILLIS);
         return socket;
     }
 
-    static Response read(InputStream in) throws IOException {
+    public static Response read(InputStream in) throws IOException {
         String statusLine = readLine(in);
         if (statusLine == null || statusLine.isEmpty()) {
             throw new IOException("empty response");
@@ -107,11 +107,11 @@ final class RawHttpClient {
         return data;
     }
 
-    static final class Response {
+    public static final class Response {
 
-        final int status;
-        final Map<String, String> headers;
-        final byte[] body;
+        public final int status;
+        public final Map<String, String> headers;
+        public final byte[] body;
 
         Response(int status, Map<String, String> headers, byte[] body) {
             this.status = status;
@@ -119,11 +119,11 @@ final class RawHttpClient {
             this.body = body;
         }
 
-        String header(String name) {
+        public String header(String name) {
             return headers.get(name);
         }
 
-        String bodyText() {
+        public String bodyText() {
             return new String(body, StandardCharsets.UTF_8);
         }
     }

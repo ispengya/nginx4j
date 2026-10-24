@@ -1,7 +1,11 @@
 package com.ispengya.nginx4j.http;
 
+import io.netty.handler.codec.http.HttpHeaderNames;
+import io.netty.handler.codec.http.HttpHeaders;
+
 import java.util.Collections;
 import java.util.HashSet;
+import java.util.Locale;
 import java.util.Set;
 
 /**
@@ -32,5 +36,28 @@ public final class HttpConstants {
     }
 
     private HttpConstants() {
+    }
+
+    /**
+     * Removes every hop-by-hop header from one message, including the extension headers named by the
+     * message's own {@code Connection} header (RFC 7230 section 6.1).
+     *
+     * <p>Callers that need to re-frame a chunked body must read
+     * {@code HttpUtil.isTransferEncodingChunked(message)} before calling this method, because the
+     * transfer coding is removed along with the rest of the hop-by-hop set.
+     */
+    public static void removeHopByHop(HttpHeaders headers) {
+        Set<String> names = new HashSet<String>(HOP_BY_HOP_HEADERS);
+        for (String connection : headers.getAll(HttpHeaderNames.CONNECTION)) {
+            for (String token : connection.split(",")) {
+                String name = token.trim().toLowerCase(Locale.ROOT);
+                if (!name.isEmpty()) {
+                    names.add(name);
+                }
+            }
+        }
+        for (String name : names) {
+            headers.remove(name);
+        }
     }
 }
