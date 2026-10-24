@@ -202,7 +202,9 @@ public final class Router {
                 }
             });
             this.serverDefaults = new ResolvedLocation(block, null, block.root(), block.indexFiles(),
-                    block.autoIndex(), block.keepAliveTimeoutMillis());
+                    block.autoIndex(), block.keepAliveTimeoutMillis(), null,
+                    block.proxySetHeaders(), block.proxyConnectTimeoutMillis(),
+                    block.proxyReadTimeoutMillis(), block.proxySendTimeoutMillis());
         }
 
         ServerBlock block() {
@@ -235,7 +237,10 @@ public final class Router {
 
         private ResolvedLocation resolve(LocationBlock location) {
             return new ResolvedLocation(block, location, location.root(), location.indexFiles(),
-                    location.autoIndex(), location.keepAliveTimeoutMillis());
+                    location.autoIndex(), location.keepAliveTimeoutMillis(),
+                    location.proxyTarget(), location.proxySetHeaders(),
+                    location.proxyConnectTimeoutMillis(), location.proxyReadTimeoutMillis(),
+                    location.proxySendTimeoutMillis());
         }
     }
 

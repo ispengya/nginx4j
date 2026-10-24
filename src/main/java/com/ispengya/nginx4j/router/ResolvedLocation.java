@@ -1,10 +1,14 @@
 package com.ispengya.nginx4j.router;
 
 import com.ispengya.nginx4j.conf.LocationBlock;
+import com.ispengya.nginx4j.conf.ProxyTarget;
 import com.ispengya.nginx4j.conf.ServerBlock;
 
 import java.nio.file.Path;
+import java.util.Collections;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 
 /**
  * The effective configuration of one request after routing.
@@ -23,15 +27,38 @@ public final class ResolvedLocation {
     private final List<String> indexFiles;
     private final boolean autoIndex;
     private final long keepAliveTimeoutMillis;
+    private final ProxyTarget proxyTarget;
+    private final Map<String, String> proxySetHeaders;
+    private final long proxyConnectTimeoutMillis;
+    private final long proxyReadTimeoutMillis;
+    private final long proxySendTimeoutMillis;
 
+    /**
+     * Builds a static resolution, used by tests that do not exercise proxying.
+     */
     ResolvedLocation(ServerBlock server, LocationBlock location, Path root, List<String> indexFiles,
             boolean autoIndex, long keepAliveTimeoutMillis) {
+        this(server, location, root, indexFiles, autoIndex, keepAliveTimeoutMillis, null,
+                Collections.<String, String>emptyMap(), ServerBlock.DEFAULT_PROXY_TIMEOUT_MILLIS,
+                ServerBlock.DEFAULT_PROXY_TIMEOUT_MILLIS, ServerBlock.DEFAULT_PROXY_TIMEOUT_MILLIS);
+    }
+
+    ResolvedLocation(ServerBlock server, LocationBlock location, Path root, List<String> indexFiles,
+            boolean autoIndex, long keepAliveTimeoutMillis, ProxyTarget proxyTarget,
+            Map<String, String> proxySetHeaders, long proxyConnectTimeoutMillis,
+            long proxyReadTimeoutMillis, long proxySendTimeoutMillis) {
         this.server = server;
         this.location = location;
         this.root = root;
         this.indexFiles = indexFiles;
         this.autoIndex = autoIndex;
         this.keepAliveTimeoutMillis = keepAliveTimeoutMillis;
+        this.proxyTarget = proxyTarget;
+        this.proxySetHeaders = Collections.unmodifiableMap(
+                new LinkedHashMap<String, String>(proxySetHeaders));
+        this.proxyConnectTimeoutMillis = proxyConnectTimeoutMillis;
+        this.proxyReadTimeoutMillis = proxyReadTimeoutMillis;
+        this.proxySendTimeoutMillis = proxySendTimeoutMillis;
     }
 
     /** @return the virtual server that owns the request */
@@ -63,6 +90,33 @@ public final class ResolvedLocation {
 
     public long keepAliveTimeoutMillis() {
         return keepAliveTimeoutMillis;
+    }
+
+    /** @return the proxy target, or {@code null} when this request is served from disk */
+    public ProxyTarget proxyTarget() {
+        return proxyTarget;
+    }
+
+    /** @return whether this request must be forwarded instead of served from disk */
+    public boolean isProxy() {
+        return proxyTarget != null;
+    }
+
+    /** @return effective {@code proxy_set_header} values, merged http → server → location by name */
+    public Map<String, String> proxySetHeaders() {
+        return proxySetHeaders;
+    }
+
+    public long proxyConnectTimeoutMillis() {
+        return proxyConnectTimeoutMillis;
+    }
+
+    public long proxyReadTimeoutMillis() {
+        return proxyReadTimeoutMillis;
+    }
+
+    public long proxySendTimeoutMillis() {
+        return proxySendTimeoutMillis;
     }
 
     @Override

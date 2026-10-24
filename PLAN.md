@@ -18,8 +18,8 @@
 | M0 | pom + Main + 线程模型接线 + 最小静态文件服务 | `curl :8080` 返回文件且长度/哈希一致 | ☑ |
 | M1 | 静态文件补全：Range(206/416)、ETag/If-None-Match/If-Modified-Since/If-Range、目录 301、autoindex、index 可配置 | `mvn test` 33 个用例全绿；curl 逐个头/字节核对 | ☑ |
 | M2 | conf 子集解析 + server/location 路由（优先级照抄 nginx：`=` → `^~` → 最长前缀 → `~` 正则） | 优先级用例表全绿 | ☑ |
-| M3 | 反代核心：UpstreamPool、头部改写、流式响应泵、RR+weight、三段超时 | 代理到 Jetty demo；SSE 边收边到；大下载期间堆平稳 | ☐ |
-| M4 | 弹性：失败重试、被动健康检查、least_conn/ip_hash、draining 停机 | kill -9 后端无 502 风暴；重启不断流 | ☐ |
+| M3 | 反代核心：头部改写、流式响应泵、RR+weight、三段超时 | 代理到 Jetty demo；SSE 边收边到；大下载期间堆平稳 | ☐ 1/6：配置解析完成 |
+| M4 | 弹性与复用：失败重试、被动健康检查、上游连接池 keepalive（含 `proxy_http_version`）、least_conn/ip_hash、draining 停机 | kill -9 后端无 502 风暴；重启不断流 | ☐ |
 | M5 | 增强：TLS/SNI、gzip、limit_req、access_log、WebSocket 隧道 | wss 聊天穿透代理 | ☐ |
 | M6 | 压测调优：泄漏检测跑全场景、水位/池参数、与 nginx 的 wrk 对比报告 | 报告存档 | ☐ |
 
@@ -87,7 +87,7 @@ upstreamChannel.attr(TXN).set(null);     // 归还池前清空
    后端 `HttpClientCodec → 响应泵回前端`；ProxyBridge 是难点所在。
 2. **流式优先**：body chunk 进 chunk 出，不聚合；按 `HttpRequest + HttpContent` 序列处理。
 3. **背压必做**：写出不可写时关读入 autoRead，`ChannelWritabilityChangedEvent` 恢复。
-4. **两段 keep-alive 独立**：前端由 KeepAliveHandler 管闲置超时；后端进 UpstreamPool
+4. **两段 keep-alive 独立**（M3 只做前半句：后端池化推迟到 M4，见 9.6 的 M3-D5）：前端由 KeepAliveHandler 管闲置超时；后端进 UpstreamPool
    空闲队列复用+探活；一条后端连接同一时刻只挂一个在途请求。
 5. **配置不可变**：解析产物只读；reload = 原子换引用，运行中请求继续用旧快照。
 
@@ -187,9 +187,17 @@ curl.exe -sS -D - -o NUL http://localhost:8080/index.html             # 取 ETag
 |---|---|
 | main | `worker_processes <n\|auto>`、`events { }`、`http { }` |
 | events | `worker_connections <n>`（解析+校验，M6 调优时才生效） |
-| http | `keepalive_timeout <time> [header_timeout]`、`root`、`index`、`autoindex`、`server { }` |
-| server | `listen`、`server_name`、`root`、`index`、`autoindex`、`keepalive_timeout`、`location { }` |
-| location | `root`、`index`、`autoindex`、`keepalive_timeout` |
+| http | `keepalive_timeout <time> [header_timeout]`、`root`、`index`、`autoindex`、`server { }`、`upstream NAME { ... }`、`proxy_set_header`、`proxy_connect_timeout`、`proxy_read_timeout`、`proxy_send_timeout` |
+| server | `listen`、`server_name`、`root`、`index`、`autoindex`、`keepalive_timeout`、`proxy_set_header`、三条 `proxy_*_timeout`、`location { }` |
+| location | `root`、`index`、`autoindex`、`keepalive_timeout`、`proxy_pass <http://host[:port] \| http://upstream_name>`、`proxy_set_header`、三条 `proxy_*_timeout` |
+| upstream | `server ADDR[:PORT] [weight=N]` |
+
+> **M3 进度**：反代指令已由 M3 第 1 步解析进配置模型（`UpstreamBlock` / `ProxyTarget`），
+> 但**运行时转发尚未接线**（M3 第 3 步）。接线前带 `proxy_pass` 的 location 仍按静态路径处理，
+> 该中间状态不要用于对外服务。
+>
+> **M3 推迟项**：`proxy_http_version` 与上游连接复用（`keepalive`）一起推到 **M4**；
+> M3 恒为"一请求一条上游连接、用完即关"（见 9.2 与 9.6 的 M3-D5）。
 
 - 词法：`#` 至行尾为注释；`{` `}` `;` 是结构符；单/双引号可包裹含空白与结构符的 token；
   含 `$` 的 token 直接报错（变量是 M5/P2 的事）。错误信息必须带 `文件名:行:列`。
@@ -233,3 +241,201 @@ curl.exe -sS -D - -o NUL http://localhost:8080/index.html             # 取 ETag
 | L2 | `ConfIntegrationTest` | `--port 0` + 临时 conf 起真实服务：按 Host 分两个 server 各自 root、location 覆盖 root、`=`/正则/前缀各返回预期内容、conf 里的 keepalive 生效 |
 
 验收：`mvn -B test` 全绿（M1 的 33 个用例 + M2 新增），L2 至少覆盖"同一端口两个 Host 分流到不同 root"。
+
+## 9. M3 实施设计（反向代理核心）
+
+> 一句话目标：让一个 location 把请求**流式**转给上游，再把响应**流式**泵回来 —— 全程不聚合、不跨 EventLoop、不阻塞。
+
+### 9.1 范围与非目标
+
+做（对应第 2 节 M3 行）：
+
+1. `upstream` 块与 `proxy_pass` 的 conf 子集（指令表已在 8.1 节加行）；
+2. 请求/响应头改写（hop-by-hop 清洗、XFF、Host、两跳 Connection 分别重写）；
+3. 流式请求/响应泵（chunk 进 chunk 出）+ 双向背压；
+4. RR + weight 负载均衡（per-EventLoop 游标）；
+5. 三段超时（connect / read / send）；
+6. Jetty demo 测试床 + 裸 socket 集成测试（SSE、慢客户端、大下载）。
+
+**明确不做**（写明归属，杜绝范围蔓延）：
+
+- **上游连接复用**（连接池、`proxy_http_version`、`keepalive`）→ **M4**；M3 恒为"一请求一条上游连接、用完即关"。
+  3.3 节的状态归属表与第 4 节第 4 条描述的池模型不变，只是 M3 不落地它，两者与 M3 行为因此不冲突；
+- 失败重试、被动健康检查、`max_fails`/`fail_timeout`/`backup`/`down`、`least_conn`/`ip_hash` → **M4**；
+- TLS/SNI、`https://` 上游、gzip、limit_req、WebSocket 隧道 → **M5**；
+- 带 URI 的 `proxy_pass`（前缀替换）、`proxy_redirect`、`rewrite`/`map`、`proxy_cache`、`alias` → **P2**；
+- 运行时 DNS 重解析（见 M3-D3）。
+
+### 9.2 指令语义与校验（表在 8.1 节）
+
+`upstream NAME { server ADDR[:PORT] [weight=N]; ... }`
+
+- 只在 `http` 上下文；`NAME` 唯一且非空；至少一个 `server`；重名或空 upstream 报错。
+- `weight` 正整数、上限 10000（照抄 nginx 上限），缺省 1。
+- `server` 的其余参数（`max_fails`、`fail_timeout`、`backup`、`down`、`max_conns`）报错并指向 M4；
+  `least_conn`/`ip_hash`/`keepalive` 作为 upstream 内指令同样指向 M4（`plannedMilestone` 已有这三项）。
+
+`proxy_pass URL`
+
+- 子集：`http://host[:port]` 或 `http://upstream_name`；端口缺省 80。
+- **拒绝**：`https://`（M5）、带 path/query 的 URL（M3-D2，指向 P2）、含 `$` 的 token（`checkNoVariables`）、
+  server 级或 http 级的 `proxy_pass`（提示"写在 location 内"）。
+- 歧义规则照抄 nginx：URL 的 host 命中已定义 upstream 名 → 按 upstream 处理，否则按主机名。
+
+`proxy_set_header NAME VALUE`
+
+- 可出现在 http / server / location，**按名覆盖合并**（同名覆盖，其余继承项保留）；空 `VALUE` = 删除该头。
+- `VALUE` 只接受字面量：M3 不支持 `$host`/`$remote_addr`/`$proxy_add_x_forwarded_for` 等变量（P2/M5）。
+- `NAME` 非法字符（空格、冒号）、`VALUE` 含换行一律报错（头注入防线）。
+
+`proxy_http_version`：**M3 拒绝**，与上游连接复用一起推迟到 M4。M3 对上游恒发 `Connection: close`，
+一请求一条连接、响应结束即关闭 —— 复用所需的池语义只有和它一起做才自洽（M3-D5）。
+
+`proxy_connect_timeout` / `proxy_read_timeout` / `proxy_send_timeout <time>`：复用 `parseTimeMillis`
+（后缀 `ms/s/m/h/d`，无后缀按秒），三者缺省均 **60s**（nginx 缺省）。
+
+### 9.3 配置模型改动
+
+| 文件 | 改动 |
+|---|---|
+| `conf/UpstreamBlock`（新） | `name()` + 不可变 `List<UpstreamServer>` |
+| `conf/UpstreamServer`（新） | host / port / weight；惰性解析出的 IP 列表（M3-D3） |
+| `conf/ProxyTarget`（新，**放 conf 包**） | scheme（M3 恒 http）/ host / port / upstreamName（可空）+ `describe()`。放 conf 是依赖方向决定的：`conf ← router ← proxy`，放 proxy 会让 conf 反向依赖 |
+| `conf/HttpBlock` | 增 `List<UpstreamBlock> upstreams` 与 `upstream(String)`；`singleServer(...)` 传空表，M0/M1 便捷路径不变 |
+| `conf/LocationBlock` | 增 `proxyTarget`（null = 静态）、`proxySetHeaders`（保序）、三个超时 |
+| `conf/ServerBlock` | 增同一组可继承字段（location 未覆盖时取它），维持"解析期折叠、运行时不查父级"（8.2 不变量） |
+| `router/ResolvedLocation` | 增 `isProxy()`、`proxyTarget()`、`proxySetHeaders()`、三个超时 |
+| `conf/ConfParser` | `Overrides` 增字段与 `seen` 标志，`applyInheritable` 增分支，`buildHttpBlock` 折叠顺序 http → server → location 不变；`parseHttp` 增 `upstream` 块分支；`plannedMilestone` 按 M3-D6 调整 |
+
+**构造器连锁成本**：`LocationBlock`/`ServerBlock`/`HttpBlock` 的构造器都是 public，`RouterTest`/`ConfParserTest`/
+`StaticFileHandlerTest` 直接 `new` 它们。M3 用**新增重载 + 旧签名委托新签名**的方式消化，旧签名补 null/空值
+即静态行为，避免测试大面积改签名（26 个用例的构造调用不动）。
+
+### 9.4 运行时结构
+
+依赖方向不变：`conf ← router ← proxy ← server`。后端 pipeline 只有 `HttpClientCodec → ProxyBackendHandler`
+（按需再加 `IdleStateHandler`/`WriteTimeoutHandler`）；**仍然禁用 `HttpObjectAggregator`**。
+因为没有连接池，上游连接与事务同寿命：建连 → 转发请求 → 泵回响应 → 关闭。
+
+| 类（包） | 职责 |
+|---|---|
+| `server/RequestDispatcher`（新） | 每 channel 一个，唯一入口：路由 → 按 `ResolvedLocation.isProxy()` 走静态或代理；统一错误响应 |
+| `server/IdleTimeoutHandler`（新） | 把 M1 的 keep-alive 计时器抽出来（`start/cancel/channelInactive` 清理），静态与代理共用（M3-D1/M3-D7） |
+| `proxy/ProxyFrontendHandler`（新） | 前端入站：改写请求头、建上游连接、把 `HttpRequest + HttpContent` 序列流式转发、超时、异常→502/504 |
+| `proxy/ProxyBackendHandler`（新） | 后端入站：`HttpResponse + HttpContent` 流式泵回前端、清 hop-by-hop、收尾时关闭上游连接并清 TXN |
+| `proxy/LoadBalancer`（新） | 平滑加权轮询：`current += weight; 选最大; current[selected] -= total`；游标 per-EventLoop |
+| `proxy/ProxyTransaction`（新） | 一次代理的事务对象；两端 Channel 用 `TXN` 属性互指（3.4 的属性互指部分；"池内 TXN 必须为空"那条不变量随 M3 推迟而暂不适用）；持有超时 future 与状态机 |
+| `proxy/ProxyRequestRewriter` / `proxy/ProxyResponseRewriter`（新） | 9.5 的改写规则，纯函数式、可 EmbeddedChannel 单测 |
+| `http/HttpConstants` | 已备好 `HOP_BY_HOP_HEADERS`；M3 补"客户端 `Connection` 头点名的扩展跳头"处理（见 9.9 第 1 条） |
+
+### 9.5 关键流程
+
+**建连**：需要转发时 `new Bootstrap().group(ctx.channel().eventLoop())` 建一条新连接（硬约束：前后端同 EventLoop），
+随即 `attr(TXN).set(txn)` 把两端绑成一次事务。M3 **不借也不还**：连接与这一个请求同寿命，响应结束即关。
+
+**请求改写规则**：
+
+- 删 hop-by-hop：固定 8 个头 **加上** 客户端 `Connection` 头里点名的 token（RFC 7230 6.1）；
+- `Host`：默认改写为 `proxy_pass` 的主机（非默认端口时带端口），`proxy_set_header Host` 可覆盖；
+- `X-Forwarded-For`：追加 `ctx.channel().remoteAddress()` 的 IP（取不到写 `unknown`），保留既有链；可被 `proxy_set_header` 覆盖；
+- `X-Real-IP`/`X-Forwarded-Proto`：M3 **不自动加**（nginx 也不自动加，靠用户 `proxy_set_header`；无变量支持，只能写字面量）；
+- `Connection`：M3 恒发 `close`（没有池就不复用上游连接；客户端那份 `Connection` 已按 hop-by-hop 删掉）；
+- `Transfer-Encoding`/`Content-Length`：不手改，交给 `HttpClientCodec` 按 `HttpRequest` 编码；
+- `Accept-Encoding`：原样透传（M3 没有 gzip，上游压缩会原样穿过）；
+- `Expect: 100-continue`：M3 直接透传，不引入 `HttpServerExpectContinueHandler`（M5 再评估）；
+- 方法：**不限 GET/HEAD**（静态路径的 405 限制不适用于代理）。
+
+**响应改写规则**：
+
+- 删 hop-by-hop（含上游 `Connection` 点名项）；不管上游怎么应答，本响应结束都关闭上游连接；
+- `Server`/`Date`/`Content-Type`/`Content-Length`/`ETag`/`Location` 原样透传（M3 无 `proxy_hide_header`/`proxy_redirect`）；
+- HEAD/304/204 只写头，`LastHttpContent` 照发；
+- 上游的 `Connection` 头**绝不**透传给客户端，客户端的 Connection 语义只由 `HttpServerKeepAliveHandler` + `RequestDispatcher` 决定。
+
+**流式泵与收尾**：
+
+- 请求侧：`HttpRequest` 头转发后，后续 `HttpContent` 逐块转发，**禁止聚合**；
+- 响应侧：`HttpResponse` 立即写出，`HttpContent` 逐块 `writeAndFlush`；
+- 收尾时机：前端 `LastHttpContent` 写**完成之后**（挂 `ChannelFutureListener`，不是调用栈内）
+  → `attr(TXN).set(null)` + 关闭上游连接；
+- 异常/双端关闭路径：清 TXN + 关闭双端，不留任何半开连接。
+
+**背压（必做）**：
+
+- 后端 `isWritable()==false` → 前端 `setAutoRead(false)`；恢复可写 → 恢复读；
+- 前端不可写 → 同样关后端 autoRead；
+- 两侧都监听 `ChannelWritabilityChangedEvent`；不可写时绝不允许继续读入（否则 body 全堆在堆里，直接违反"大下载期间堆平稳"）。
+
+**三段超时**：
+
+| 指令 | 语义 | 实现 | 超时结果 |
+|---|---|---|---|
+| `proxy_connect_timeout` | 建连完成 | connect future + `ctx.executor().schedule` | 502（拒连）/ 504（超时）；响应头未发则可 keep-alive |
+| `proxy_read_timeout` | 两次**后端入站读**之间 | 后端 `IdleStateHandler(0, read, 0)`（连接只服务于在途请求，不存在"池中空闲"状态） | 504；已发响应头则只能关前端连接 |
+| `proxy_send_timeout` | 向后端单次写完成 | `WriteTimeoutHandler(send)`（与 nginx"两次写之间"是**近似**，见 9.9 第 7 条） | 同上 |
+
+### 9.6 M3 决策记录
+
+| # | 决策 | 结果与理由 |
+|---|---|---|
+| M3-D1 | keep-alive 计时器归属 | 抽成 `IdleTimeoutHandler` 单点持有；静态与代理必须共用同一个时钟，否则两条路径的计时器互不可见（会放大 5 节第 9 条的坑） |
+| M3-D2 | 带 URI 的 `proxy_pass` | M3 拒绝并指向 P2；前缀替换配上变量才是完整语义，半实现最容易产出静默错路径 |
+| M3-D3 | 上游主机名解析 | **解析期**用 `InetAddress.getAllByName` 解析成 IP 列表并缓存，运行期零 DNS（与 nginx 启动期解析一致；字面 IP 不走 DNS，测试全用 IP）。解析失败报 `文件:行:列`。**已定稿**，不做运行时 DNS 轮询 |
+| M3-D4 | LB 游标 | per-EventLoop（沿用 3.3/3.5 P2）；M4 若发现局部视图不够准再评估全局计数 |
+| M3-D5 | 上游连接复用 | **M3 不做，推迟到 M4**：连接池、`proxy_http_version`、`keepalive` 三者必须一起做才自洽。M3 一请求一条连接、响应结束即关，因此池容量这类参数在 M3 不存在 |
+| M3-D6 | `proxy_next_upstream` | 从 `plannedMilestone` 的 "M3 reverse proxy" **改到 M4**（重试属 M4 弹性范围），M3 仍拒绝；`ConfParserTest` 的提示断言同步改 |
+| M3-D7 | 静态路径重构幅度 | 保留 `StaticFileHandler` 的响应逻辑与 4 参数测试构造器，只把"路由"与"计时器"两个职责上移到 `RequestDispatcher`/`IdleTimeoutHandler` |
+
+**状态：M3-D1…D7 已于 2026-10-13 定稿（M3-D5 复审后改为"推迟到 M4"），第 9 节即实现依据。** 代码不得偏离本表；
+确实需要偏离时，先改这一行再改代码（与 8.1 节的指令表同一套纪律）。8.1 表继续保留带 `（**M3**）` 的行作为唯一定义处，
+不另开第二张增量表。
+
+### 9.7 测试表
+
+| 层 | 文件 | 覆盖 |
+|---|---|---|
+| L1 | `proxy/ProxyRequestRewriterTest` | hop-by-hop 全删（含 `Connection` 点名头）、XFF 追加与覆盖、Host 重写、`proxy_set_header X ""` 删头、对上游恒发 `Connection: close` |
+| L1 | `proxy/ProxyResponseRewriterTest` | 响应 hop-by-hop 删净、HEAD/204/304 无 body、上游 `Connection: keep-alive` 不被采纳 |
+| L1 | `proxy/RoundRobinLoadBalancerTest` | weight 1/2/3 的平滑序列（固定 N 次的期望序列）、单节点退化、per-loop 独立 |
+| L1 | `conf/ConfParserTest`（增） | upstream 与 weight、引用未定义 upstream、`https://`、带 URI 的 `proxy_pass`、server 级 `proxy_pass`、upstream 内 M4 指令、`proxy_http_version` 与 `keepalive` 报错并指向 M4、`proxy_set_header` 三级继承与同名覆盖 —— 错误路径一律断言 文件:行:列 |
+| L2 | `proxy/ProxyIntegrationTest` | 内置 Netty mock 上游：SSE 边收边到（裸 socket 读时间戳）、1GB 下载堆平稳 + PARANOID 无泄漏、慢读客户端背压（断言服务端真的关了 autoRead）、**一请求一连接**（上游记录连接数 = 请求数，证明没有偷偷复用）、502（拒连）、504（不响应） |
+| L3 | `testbed/upstream`（Jetty demo）+ 手测清单 | 见 9.8 |
+
+约定沿用第 6 节：集成测试一律 `--port 0` 并在 `@After` 里 `stop()`；二进制内容 `assertArrayEquals`；
+带引号的头必须用裸 socket 发。
+
+### 9.8 验收清单（对应 M3 行的三条标准）
+
+1. `mvn -B clean package` 全绿（M2 的 67 个用例 + M3 新增），PARANOID 泄漏检测零报告。
+2. 测试床补 Jetty demo（`testbed/upstream/`，本地不提交，照 `testbed/` 的排除方式）：`/hello`、`/sse`（每秒一条）、
+   `/big`（大流）；conf 里 `location /api/ { proxy_pass http://127.0.0.1:9000; }`。
+3. curl 清单（逐项记录输出，照 M1/M2 的方式回填第 7 节）：
+   - `curl -i localhost:8080/api/hello` → 200 且 body 与直连上游逐字节一致；
+   - `curl -N localhost:8080/api/sse` → 事件**边到边打**（时间戳间隔 ≈1s，而不是收完一次性输出）；
+   - `curl -i -H 'Connection: close' ...` → 响应头里没有上游 hop-by-hop 残留；
+   - 连续两次 `curl -i localhost:8080/api/hello` → 上游侧连接数 **+2**（M3 不复用连接，这条把"没做池"钉成预期行为）；
+   - 关掉 Jetty → 502；Jetty 挂起不响应（配 `proxy_read_timeout 2s`）→ 504；
+   - 大文件经代理下载后 `sha256sum` 与直连一致（流式不损坏）。
+4. **背压与堆平稳**：`--worker-threads 1` + 裸 socket 慢读客户端（每 100ms 读 64KB）拉 1GB，
+   在 `-Xmx256m` + `-Dio.netty.leakDetection.level=PARANOID` 下不 OOM、日志无 `LEAK`。
+5. 结论按 M0/M1/M2 的样式写进第 7 节，并把 Agent.md 的"当前状态/下一步"推进到 M4。
+
+### 9.9 预期坑（实现时验证，确认后回填第 5 节）
+
+1. **`Connection: X-Foo` 点名的自定义跳头必须一并删** —— 只删固定 8 个是安全洞（RFC 7230 6.1）。
+2. 上游连接是"一请求一条、用完即关"：收尾时漏掉 `close()` 会把 fd 一点点泄漏，也让 M4 上池化时多出一批来路不明的连接。
+3. 上游应答 `Connection: keep-alive` 也必须无视并关闭 —— M3 不维护池，留着这条连接只会变成无人管理的半开连接。
+4. 小响应同步写完（5 节第 9 条同源）：关闭上游连接与清 TXN 必须挂在 `writeAndFlush` 的 listener 上，不能在调用栈内做。
+5. 前后端 autoRead 互关的死锁：一次事件里只改**对侧**的 autoRead，避免自己关了自己后无人恢复。
+6. `LastHttpContent` 是清 TXN 的唯一合法时机；`exceptionCaught`/`channelInactive` 必须走"丢弃 + 关闭双端"，不能只关一侧。
+7. `WriteTimeoutHandler` 与 nginx `proxy_send_timeout` 语义只是近似（单次写完成 vs 两次写之间），差异记档。
+8. HEAD 代理：上游会给 `Content-Length` 但不发 body，前端不能因长度不符而卡住或补 body。
+
+### 9.10 分步提交
+
+1. `M3: parse upstream and proxy_pass directives`（conf 模型 + 8.1 表 + ConfParserTest）
+2. `M3: rewrite proxy request and response headers`（两个 Rewriter + 单测）
+3. `M3: pick an upstream and stream one exchange over one EventLoop`（LB + Frontend/Backend handler + 最小竖切集成测试）
+4. `M3: enforce the three proxy timeouts`
+5. `M3: add backpressure and the Jetty testbed`（含 `testbed/upstream/`）
+6. `M3: record the M3 acceptance and move the status to M4`（回填第 7 节 + Agent.md）

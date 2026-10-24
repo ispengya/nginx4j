@@ -46,6 +46,9 @@ M0、M1、M2 已完成并通过验收（证据见 PLAN.md 第 7 节）：
   `StaticFileHandlerTest` 18 + `HttpServerIntegrationTest` 7 + `ServerOptionsTest` 10），
   `mvn -B test` 一条命令跑完单测与集成测试。
 
-下一步：M3 反代最小竖切（同 EventLoop + 流式泵 + 背压）。`upstream`、`proxy_pass`、
-`proxy_*_timeout` 等指令目前会被解析器拒绝并提示"planned for M3 reverse proxy"，
-实现时把它们加进 8.1 节的指令表即可。
+M3 第 1 步（配置解析）已完成：`upstream`、`proxy_pass`、`proxy_set_header` 与三条
+`proxy_*_timeout` 已解析进 `UpstreamBlock` / `ProxyTarget`，上游主机在解析期完成 DNS 解析；
+`proxy_http_version` 与上游连接复用推迟到 M4。**运行时转发尚未接线**，带 `proxy_pass` 的
+location 目前仍按静态路径处理，这个中间状态不要用于对外服务。
+
+下一步：M3 第 2 步（请求/响应头改写），然后是最小竖切（同 EventLoop + 流式泵 + 背压）。

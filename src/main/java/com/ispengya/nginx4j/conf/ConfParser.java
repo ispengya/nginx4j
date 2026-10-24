@@ -1,14 +1,21 @@
 package com.ispengya.nginx4j.conf;
 
 import java.io.IOException;
+import java.net.InetAddress;
+import java.net.UnknownHostException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.InvalidPathException;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
+import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
+import java.util.Set;
 import java.util.regex.Pattern;
 import java.util.regex.PatternSyntaxException;
 
@@ -143,6 +150,8 @@ public final class ConfParser {
 
     private HttpBlock parseHttp(Directive httpDirective) {
         Overrides httpOverrides = new Overrides();
+        List<UpstreamBlock> upstreams = new ArrayList<UpstreamBlock>();
+        Set<String> upstreamNames = new HashSet<String>();
         List<ServerBuilder> serverBuilders = new ArrayList<ServerBuilder>();
 
         while (!atBlockEnd()) {
@@ -156,8 +165,21 @@ public final class ConfParser {
                 serverBuilders.add(parseServer(directive));
                 continue;
             }
+            if ("upstream".equals(directive.name)) {
+                UpstreamBlock upstream = parseUpstream(directive);
+                if (!upstreamNames.add(upstream.name())) {
+                    throw error(directive.args.get(0),
+                            "duplicate upstream '" + upstream.name() + "'");
+                }
+                upstreams.add(upstream);
+                continue;
+            }
+            if ("proxy_pass".equals(directive.name)) {
+                throw error(directive.nameToken, "'proxy_pass' belongs in a 'location' block");
+            }
             throw unknownDirective(directive, "keepalive_timeout", "root", "index", "autoindex",
-                    "server");
+                    "proxy_set_header", "proxy_connect_timeout", "proxy_read_timeout",
+                    "proxy_send_timeout", "upstream", "server");
         }
         expectBlockEnd("http");
 
@@ -165,7 +187,7 @@ public final class ConfParser {
             throw error(httpDirective.nameToken,
                     "'http' block needs at least one 'server' block");
         }
-        return buildHttpBlock(httpDirective, httpOverrides, serverBuilders);
+        return buildHttpBlock(httpDirective, httpOverrides, upstreams, serverBuilders);
     }
 
     private ServerBuilder parseServer(Directive serverDirective) {
@@ -191,8 +213,15 @@ public final class ConfParser {
                 server.locations.add(parseLocation(directive));
                 continue;
             }
+            if ("proxy_pass".equals(directive.name)) {
+                throw error(directive.nameToken, "'proxy_pass' belongs in a 'location' block");
+            }
+            if ("upstream".equals(directive.name)) {
+                throw error(directive.nameToken, "'upstream' blocks belong in the 'http' block");
+            }
             throw unknownDirective(directive, "listen", "server_name", "root", "index", "autoindex",
-                    "keepalive_timeout", "location");
+                    "keepalive_timeout", "proxy_set_header", "proxy_connect_timeout",
+                    "proxy_read_timeout", "proxy_send_timeout", "location");
         }
         expectBlockEnd("server");
         return server;
@@ -210,10 +239,295 @@ public final class ConfParser {
                 throw error(directive.nameToken,
                         "nested 'location' blocks are not supported in M2");
             }
-            throw unknownDirective(directive, "root", "index", "autoindex", "keepalive_timeout");
+            if ("proxy_pass".equals(directive.name)) {
+                requireSimple(directive);
+                requireFirstOccurrence(location.proxyPassSeen, directive);
+                parseProxyPass(directive, location);
+                location.proxyPassSeen = true;
+                continue;
+            }
+            if ("upstream".equals(directive.name)) {
+                throw error(directive.nameToken, "'upstream' blocks belong in the 'http' block");
+            }
+            throw unknownDirective(directive, "root", "index", "autoindex", "keepalive_timeout",
+                    "proxy_pass", "proxy_set_header", "proxy_connect_timeout",
+                    "proxy_read_timeout", "proxy_send_timeout");
         }
         expectBlockEnd("location");
         return location;
+    }
+
+    private UpstreamBlock parseUpstream(Directive directive) {
+        requireBlock(directive);
+        if (directive.args.isEmpty()) {
+            throw error(directive.nameToken, "'upstream' needs a name");
+        }
+        if (directive.args.size() > 1) {
+            throw error(directive.args.get(1), "'upstream' takes exactly one name");
+        }
+        ConfTokenizer.Token nameToken = directive.args.get(0);
+        checkNoVariables(nameToken);
+        String name = nameToken.text;
+        if (name.isEmpty()) {
+            throw error(nameToken, "upstream name must not be empty");
+        }
+        validateUpstreamName(nameToken, name);
+
+        List<UpstreamServer> servers = new ArrayList<UpstreamServer>();
+        while (!atBlockEnd()) {
+            Directive member = nextDirective();
+            if (!"server".equals(member.name)) {
+                throw unknownDirective(member, "server");
+            }
+            requireSimple(member);
+            servers.add(parseUpstreamServer(member));
+        }
+        expectBlockEnd("upstream");
+        if (servers.isEmpty()) {
+            throw error(nameToken, "upstream '" + name + "' needs at least one 'server'");
+        }
+        return new UpstreamBlock(name, servers);
+    }
+
+    private UpstreamServer parseUpstreamServer(Directive directive) {
+        if (directive.args.isEmpty()) {
+            throw error(directive.nameToken, "'server' needs an address");
+        }
+        ConfTokenizer.Token addressToken = directive.args.get(0);
+        checkNoVariables(addressToken);
+        HostPort address = parseUpstreamAddress(addressToken);
+
+        int weight = 1;
+        boolean weightSeen = false;
+        for (int i = 1; i < directive.args.size(); i++) {
+            ConfTokenizer.Token parameter = directive.args.get(i);
+            String text = parameter.text;
+            if (text.startsWith("weight=")) {
+                if (weightSeen) {
+                    throw error(parameter, "duplicate 'weight' on an upstream server");
+                }
+                weight = parseWeight(parameter, text.substring("weight=".length()));
+                weightSeen = true;
+                continue;
+            }
+            String bare = text.indexOf('=') >= 0 ? text.substring(0, text.indexOf('=')) : text;
+            if (isM4UpstreamParameter(bare)) {
+                throw error(parameter, "'" + bare + "' arrives with M4 load balancing");
+            }
+            throw error(parameter, "unsupported upstream server parameter: " + text);
+        }
+
+        final List<InetAddress> addresses;
+        try {
+            addresses = Arrays.asList(InetAddress.getAllByName(address.host));
+        } catch (UnknownHostException e) {
+            throw error(addressToken, "cannot resolve upstream server host '" + address.host
+                    + "': " + e.getMessage());
+        }
+        return new UpstreamServer(address.host, address.port, weight, addresses);
+    }
+
+    private HostPort parseUpstreamAddress(ConfTokenizer.Token token) {
+        String value = token.text;
+        if (value.startsWith("unix:")) {
+            throw error(token, "unix domain sockets are not supported");
+        }
+        String host;
+        String portText;
+        if (value.startsWith("[")) {
+            int closing = value.indexOf(']');
+            if (closing < 0) {
+                throw error(token, "malformed IPv6 upstream address: " + value);
+            }
+            host = value.substring(1, closing);
+            if (value.length() == closing + 1) {
+                portText = String.valueOf(ProxyTarget.DEFAULT_HTTP_PORT);
+            } else if (value.charAt(closing + 1) == ':') {
+                portText = value.substring(closing + 2);
+            } else {
+                throw error(token, "malformed upstream address: " + value);
+            }
+        } else {
+            int colon = value.indexOf(':');
+            if (colon < 0) {
+                if (isAllDigits(value)) {
+                    throw error(token, "upstream server needs a host, not a bare port: " + value);
+                }
+                host = value;
+                portText = String.valueOf(ProxyTarget.DEFAULT_HTTP_PORT);
+            } else if (colon == value.lastIndexOf(':')) {
+                host = value.substring(0, colon);
+                portText = value.substring(colon + 1);
+            } else {
+                throw error(token, "IPv6 upstream addresses must be written as [addr]:port");
+            }
+        }
+        if (host.isEmpty()) {
+            throw error(token, "upstream server needs a host");
+        }
+        validateHost(token, host);
+        return new HostPort(host, parseUpstreamPort(portText, token));
+    }
+
+    private int parseUpstreamPort(String text, ConfTokenizer.Token token) {
+        int port;
+        try {
+            port = Integer.parseInt(text);
+        } catch (NumberFormatException e) {
+            throw error(token, "malformed port in upstream address: " + token.text);
+        }
+        if (port < 1 || port > 65535) {
+            throw error(token, "upstream port must be between 1 and 65535: " + port);
+        }
+        return port;
+    }
+
+    private int parseWeight(ConfTokenizer.Token token, String text) {
+        int weight;
+        try {
+            weight = Integer.parseInt(text);
+        } catch (NumberFormatException e) {
+            throw error(token, "weight must be a positive integer, got: " + text);
+        }
+        if (weight <= 0) {
+            throw error(token, "weight must be a positive integer, got: " + text);
+        }
+        if (weight > 10000) {
+            throw error(token, "weight must not exceed 10000, got: " + weight);
+        }
+        return weight;
+    }
+
+    private static boolean isM4UpstreamParameter(String name) {
+        return "max_fails".equals(name) || "fail_timeout".equals(name) || "backup".equals(name)
+                || "down".equals(name) || "max_conns".equals(name);
+    }
+
+    private void parseProxyPass(Directive directive, LocationBuilder location) {
+        requireArgumentCount(directive, 1);
+        ConfTokenizer.Token token = directive.args.get(0);
+        checkNoVariables(token);
+        String value = token.text;
+
+        int schemeEnd = value.indexOf("://");
+        if (schemeEnd <= 0) {
+            throw error(token, "'proxy_pass' needs an http:// URL");
+        }
+        String scheme = value.substring(0, schemeEnd);
+        if ("https".equalsIgnoreCase(scheme)) {
+            throw error(token, "https:// upstreams arrive with TLS in M5");
+        }
+        if (!"http".equalsIgnoreCase(scheme)) {
+            throw error(token, "unsupported proxy_pass scheme '" + scheme
+                    + "'; only http:// is supported in M3");
+        }
+
+        String remainder = value.substring(schemeEnd + 3);
+        int pathStart = firstIndexOf(remainder, '/', '?', '#');
+        if (pathStart >= 0) {
+            char terminator = remainder.charAt(pathStart);
+            if (terminator == '?') {
+                throw error(token, "proxy_pass with a query string is deferred to P2");
+            }
+            if (terminator == '#') {
+                throw error(token, "proxy_pass must not contain a fragment");
+            }
+            throw error(token,
+                    "proxy_pass with a URI path is deferred to P2; use 'http://host[:port]'");
+        }
+        if (remainder.indexOf('@') >= 0) {
+            throw error(token, "proxy_pass must not contain user information");
+        }
+
+        String host;
+        int port;
+        boolean explicitPort;
+        if (remainder.startsWith("[")) {
+            int closing = remainder.indexOf(']');
+            if (closing < 0) {
+                throw error(token, "malformed IPv6 proxy_pass address: " + value);
+            }
+            host = remainder.substring(1, closing);
+            if (remainder.length() == closing + 1) {
+                port = ProxyTarget.DEFAULT_HTTP_PORT;
+                explicitPort = false;
+            } else if (remainder.charAt(closing + 1) == ':') {
+                port = parseProxyPort(remainder.substring(closing + 2), token);
+                explicitPort = true;
+            } else {
+                throw error(token, "malformed proxy_pass address: " + value);
+            }
+        } else {
+            int colon = remainder.indexOf(':');
+            if (colon < 0) {
+                host = remainder;
+                port = ProxyTarget.DEFAULT_HTTP_PORT;
+                explicitPort = false;
+            } else if (colon == remainder.lastIndexOf(':')) {
+                host = remainder.substring(0, colon);
+                port = parseProxyPort(remainder.substring(colon + 1), token);
+                explicitPort = true;
+            } else {
+                throw error(token, "IPv6 proxy_pass hosts must be written as [addr]:port");
+            }
+        }
+        if (host.isEmpty()) {
+            throw error(token, "'proxy_pass' needs a host");
+        }
+        validateHost(token, host);
+
+        location.proxyHost = host;
+        location.proxyPort = port;
+        location.proxyExplicitPort = explicitPort;
+        location.proxyPassToken = token;
+    }
+
+    private int parseProxyPort(String text, ConfTokenizer.Token token) {
+        int port;
+        try {
+            port = Integer.parseInt(text);
+        } catch (NumberFormatException e) {
+            throw error(token, "malformed port in proxy_pass address: " + token.text);
+        }
+        if (port < 1 || port > 65535) {
+            throw error(token, "proxy_pass port must be between 1 and 65535: " + port);
+        }
+        return port;
+    }
+
+    private void validateUpstreamName(ConfTokenizer.Token token, String name) {
+        for (int i = 0; i < name.length(); i++) {
+            char current = name.charAt(i);
+            boolean allowed = (current >= 'a' && current <= 'z')
+                    || (current >= 'A' && current <= 'Z')
+                    || (current >= '0' && current <= '9')
+                    || current == '.' || current == '_' || current == '-';
+            if (!allowed) {
+                throw error(token, "upstream name must contain only letters, digits, '.', '_' or "
+                        + "'-': " + name);
+            }
+        }
+    }
+
+    /** Rejects characters that could never be part of a host as written in a URL or address. */
+    private void validateHost(ConfTokenizer.Token token, String host) {
+        for (int i = 0; i < host.length(); i++) {
+            char current = host.charAt(i);
+            if (Character.isWhitespace(current) || current == '/' || current == '@'
+                    || current == '?' || current == '#' || current == '[' || current == ']') {
+                throw error(token, "invalid host: " + host);
+            }
+        }
+    }
+
+    private static int firstIndexOf(String value, char first, char second, char third) {
+        for (int i = 0; i < value.length(); i++) {
+            char current = value.charAt(i);
+            if (current == first || current == second || current == third) {
+                return i;
+            }
+        }
+        return -1;
     }
 
     // ------------------------------------------------------------------ directives
@@ -250,7 +564,90 @@ public final class ConfParser {
             overrides.keepAliveSeen = true;
             return true;
         }
+        if ("proxy_set_header".equals(directive.name)) {
+            requireSimple(directive);
+            parseProxySetHeader(overrides, directive);
+            return true;
+        }
+        if ("proxy_connect_timeout".equals(directive.name)) {
+            requireSimple(directive);
+            requireFirstOccurrence(overrides.proxyConnectTimeoutSeen, directive);
+            overrides.proxyConnectTimeoutMillis = Long.valueOf(parseSingleTime(directive));
+            overrides.proxyConnectTimeoutSeen = true;
+            return true;
+        }
+        if ("proxy_read_timeout".equals(directive.name)) {
+            requireSimple(directive);
+            requireFirstOccurrence(overrides.proxyReadTimeoutSeen, directive);
+            overrides.proxyReadTimeoutMillis = Long.valueOf(parseSingleTime(directive));
+            overrides.proxyReadTimeoutSeen = true;
+            return true;
+        }
+        if ("proxy_send_timeout".equals(directive.name)) {
+            requireSimple(directive);
+            requireFirstOccurrence(overrides.proxySendTimeoutSeen, directive);
+            overrides.proxySendTimeoutMillis = Long.valueOf(parseSingleTime(directive));
+            overrides.proxySendTimeoutSeen = true;
+            return true;
+        }
         return false;
+    }
+
+    private void parseProxySetHeader(Overrides overrides, Directive directive) {
+        requireArgumentCount(directive, 2);
+        ConfTokenizer.Token nameToken = directive.args.get(0);
+        ConfTokenizer.Token valueToken = directive.args.get(1);
+        checkNoVariables(nameToken);
+        checkNoVariables(valueToken);
+        validateHeaderName(nameToken);
+        validateHeaderValue(valueToken);
+        putHeaderIgnoreCase(overrides.proxySetHeaders, nameToken.text, valueToken.text);
+    }
+
+    private long parseSingleTime(Directive directive) {
+        requireArgumentCount(directive, 1);
+        return parseTimeMillis(directive.args.get(0));
+    }
+
+    private void validateHeaderName(ConfTokenizer.Token token) {
+        String name = token.text;
+        if (name.isEmpty()) {
+            throw error(token, "proxy_set_header needs a header name");
+        }
+        for (int i = 0; i < name.length(); i++) {
+            if (!isHeaderTokenChar(name.charAt(i))) {
+                throw error(token, "invalid proxy_set_header name: " + name);
+            }
+        }
+    }
+
+    private void validateHeaderValue(ConfTokenizer.Token token) {
+        String value = token.text;
+        for (int i = 0; i < value.length(); i++) {
+            char current = value.charAt(i);
+            if (current == '\r' || current == '\n' || current == '\0') {
+                throw error(token, "proxy_set_header value must not contain line breaks or NUL");
+            }
+        }
+    }
+
+    private static boolean isHeaderTokenChar(char value) {
+        if ((value >= 'a' && value <= 'z') || (value >= 'A' && value <= 'Z')
+                || (value >= '0' && value <= '9')) {
+            return true;
+        }
+        return "!#$%&'*+-.^_`|~".indexOf(value) >= 0;
+    }
+
+    /** Keeps the first spelling of a header name and lets a later directive replace its value. */
+    private static void putHeaderIgnoreCase(Map<String, String> headers, String name, String value) {
+        for (String existing : headers.keySet()) {
+            if (existing.equalsIgnoreCase(name)) {
+                headers.put(existing, value);
+                return;
+            }
+        }
+        headers.put(name, value);
     }
 
     private LocationBuilder parseLocationHeader(Directive directive) {
@@ -424,7 +821,7 @@ public final class ConfParser {
     // ------------------------------------------------------------------ building
 
     private HttpBlock buildHttpBlock(Directive httpDirective, Overrides httpOverrides,
-            List<ServerBuilder> serverBuilders) {
+            List<UpstreamBlock> upstreams, List<ServerBuilder> serverBuilders) {
         long keepAliveTimeoutMillis = httpOverrides.keepAliveTimeoutMillis != null
                 ? httpOverrides.keepAliveTimeoutMillis.longValue()
                 : DEFAULT_KEEP_ALIVE_TIMEOUT_MILLIS;
@@ -433,6 +830,22 @@ public final class ConfParser {
                 : Collections.singletonList(DEFAULT_INDEX_FILE);
         boolean autoIndex = httpOverrides.autoIndex != null && httpOverrides.autoIndex.booleanValue();
         Path httpRoot = httpOverrides.root;
+
+        Map<String, UpstreamBlock> upstreamsByName = new LinkedHashMap<String, UpstreamBlock>();
+        for (UpstreamBlock upstream : upstreams) {
+            upstreamsByName.put(upstream.name(), upstream);
+        }
+
+        Map<String, String> httpProxyHeaders = immutableHeaders(httpOverrides.proxySetHeaders);
+        long httpProxyConnect = httpOverrides.proxyConnectTimeoutMillis != null
+                ? httpOverrides.proxyConnectTimeoutMillis.longValue()
+                : ServerBlock.DEFAULT_PROXY_TIMEOUT_MILLIS;
+        long httpProxyRead = httpOverrides.proxyReadTimeoutMillis != null
+                ? httpOverrides.proxyReadTimeoutMillis.longValue()
+                : ServerBlock.DEFAULT_PROXY_TIMEOUT_MILLIS;
+        long httpProxySend = httpOverrides.proxySendTimeoutMillis != null
+                ? httpOverrides.proxySendTimeoutMillis.longValue()
+                : ServerBlock.DEFAULT_PROXY_TIMEOUT_MILLIS;
 
         ListenEndpoint sharedEndpoint = null;
         int defaultServerCount = 0;
@@ -469,6 +882,14 @@ public final class ConfParser {
                     ? builder.overrides.autoIndex.booleanValue() : autoIndex;
             long serverKeepAlive = builder.overrides.keepAliveTimeoutMillis != null
                     ? builder.overrides.keepAliveTimeoutMillis.longValue() : keepAliveTimeoutMillis;
+            Map<String, String> serverProxyHeaders = mergeHeaders(httpProxyHeaders,
+                    builder.overrides.proxySetHeaders);
+            long serverProxyConnect = builder.overrides.proxyConnectTimeoutMillis != null
+                    ? builder.overrides.proxyConnectTimeoutMillis.longValue() : httpProxyConnect;
+            long serverProxyRead = builder.overrides.proxyReadTimeoutMillis != null
+                    ? builder.overrides.proxyReadTimeoutMillis.longValue() : httpProxyRead;
+            long serverProxySend = builder.overrides.proxySendTimeoutMillis != null
+                    ? builder.overrides.proxySendTimeoutMillis.longValue() : httpProxySend;
 
             List<LocationBlock> locations = new ArrayList<LocationBlock>(builder.locations.size());
             for (LocationBuilder location : builder.locations) {
@@ -480,17 +901,60 @@ public final class ConfParser {
                         ? location.overrides.autoIndex.booleanValue() : serverAutoIndex;
                 long locationKeepAlive = location.overrides.keepAliveTimeoutMillis != null
                         ? location.overrides.keepAliveTimeoutMillis.longValue() : serverKeepAlive;
+                Map<String, String> locationProxyHeaders = mergeHeaders(serverProxyHeaders,
+                        location.overrides.proxySetHeaders);
+                long locationProxyConnect = location.overrides.proxyConnectTimeoutMillis != null
+                        ? location.overrides.proxyConnectTimeoutMillis.longValue() : serverProxyConnect;
+                long locationProxyRead = location.overrides.proxyReadTimeoutMillis != null
+                        ? location.overrides.proxyReadTimeoutMillis.longValue() : serverProxyRead;
+                long locationProxySend = location.overrides.proxySendTimeoutMillis != null
+                        ? location.overrides.proxySendTimeoutMillis.longValue() : serverProxySend;
                 locations.add(new LocationBlock(location.modifier, location.pattern, location.regex,
-                        locationRoot, locationIndexFiles, locationAutoIndex, locationKeepAlive));
+                        locationRoot, locationIndexFiles, locationAutoIndex, locationKeepAlive,
+                        buildProxyTarget(location, upstreamsByName), locationProxyHeaders,
+                        locationProxyConnect, locationProxyRead, locationProxySend));
             }
             servers.add(new ServerBlock(builder.listeners, builder.serverNames, serverRoot,
-                    serverIndexFiles, serverAutoIndex, serverKeepAlive, locations));
+                    serverIndexFiles, serverAutoIndex, serverKeepAlive, serverProxyHeaders,
+                    serverProxyConnect, serverProxyRead, serverProxySend, locations));
         }
 
         if (sharedEndpoint == null) {
             throw error(httpDirective.nameToken, "'http' block has no listening server");
         }
-        return new HttpBlock(sharedEndpoint, servers);
+        return new HttpBlock(sharedEndpoint, upstreams, servers);
+    }
+
+    private ProxyTarget buildProxyTarget(LocationBuilder location,
+            Map<String, UpstreamBlock> upstreams) {
+        if (!location.proxyPassSeen) {
+            return null;
+        }
+        if (!location.proxyExplicitPort && upstreams.containsKey(location.proxyHost)) {
+            return ProxyTarget.upstream(location.proxyHost);
+        }
+        final List<InetAddress> addresses;
+        try {
+            addresses = Arrays.asList(InetAddress.getAllByName(location.proxyHost));
+        } catch (UnknownHostException e) {
+            throw error(location.proxyPassToken, "proxy_pass host '" + location.proxyHost
+                    + "' is neither a defined upstream nor resolvable: " + e.getMessage());
+        }
+        return ProxyTarget.direct(location.proxyHost, location.proxyPort, addresses);
+    }
+
+    private static Map<String, String> immutableHeaders(Map<String, String> headers) {
+        return Collections.unmodifiableMap(new LinkedHashMap<String, String>(headers));
+    }
+
+    /** Folds inherited headers into one context: a later value replaces a name case-insensitively. */
+    private static Map<String, String> mergeHeaders(Map<String, String> inherited,
+            Map<String, String> own) {
+        Map<String, String> merged = new LinkedHashMap<String, String>(inherited);
+        for (Map.Entry<String, String> entry : own.entrySet()) {
+            putHeaderIgnoreCase(merged, entry.getKey(), entry.getValue());
+        }
+        return Collections.unmodifiableMap(merged);
     }
 
     private static boolean hasDefaultEndpoint(List<ListenEndpoint> endpoints) {
@@ -714,11 +1178,8 @@ public final class ConfParser {
 
     /** @return where a known nginx directive is scheduled, or {@code null} when it is unknown */
     private static String plannedMilestone(String name) {
-        if ("proxy_pass".equals(name) || "upstream".equals(name) || "proxy_set_header".equals(name)
-                || "proxy_http_version".equals(name) || "proxy_connect_timeout".equals(name)
-                || "proxy_read_timeout".equals(name) || "proxy_send_timeout".equals(name)
-                || "proxy_next_upstream".equals(name)) {
-            return "M3 reverse proxy";
+        if ("proxy_http_version".equals(name) || "proxy_next_upstream".equals(name)) {
+            return "M4 load balancing";
         }
         if ("least_conn".equals(name) || "ip_hash".equals(name) || "max_fails".equals(name)
                 || "fail_timeout".equals(name) || "keepalive".equals(name)) {
@@ -811,10 +1272,17 @@ public final class ConfParser {
         private List<String> indexFiles;
         private Boolean autoIndex;
         private Long keepAliveTimeoutMillis;
+        private final Map<String, String> proxySetHeaders = new LinkedHashMap<String, String>();
+        private Long proxyConnectTimeoutMillis;
+        private Long proxyReadTimeoutMillis;
+        private Long proxySendTimeoutMillis;
         private boolean rootSeen;
         private boolean indexSeen;
         private boolean autoIndexSeen;
         private boolean keepAliveSeen;
+        private boolean proxyConnectTimeoutSeen;
+        private boolean proxyReadTimeoutSeen;
+        private boolean proxySendTimeoutSeen;
     }
 
     private static final class ServerBuilder {
@@ -837,11 +1305,28 @@ public final class ConfParser {
         private final String pattern;
         private final Overrides overrides = new Overrides();
         private Pattern regex;
+        private boolean proxyPassSeen;
+        private String proxyHost;
+        private int proxyPort;
+        private boolean proxyExplicitPort;
+        private ConfTokenizer.Token proxyPassToken;
 
         LocationBuilder(ConfTokenizer.Token patternToken, LocationModifier modifier, String pattern) {
             this.patternToken = patternToken;
             this.modifier = modifier;
             this.pattern = pattern;
+        }
+    }
+
+    /** A host and port parsed from an upstream {@code server} address. */
+    private static final class HostPort {
+
+        private final String host;
+        private final int port;
+
+        HostPort(String host, int port) {
+            this.host = host;
+            this.port = port;
         }
     }
 }

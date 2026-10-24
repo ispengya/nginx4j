@@ -3,22 +3,43 @@ package com.ispengya.nginx4j.conf;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 
 /**
- * The {@code http} block: every virtual server that shares one bound address.
+ * The {@code http} block: every virtual server that shares one bound address plus the named
+ * upstream groups those servers may proxy to.
  *
  * <p>Values are not stored here because inheritance is folded into each {@link ServerBlock} at parse
- * time (PLAN.md section 8.2). What remains is the endpoint the server binds and the server list in
- * configuration order, which is also the tie-breaker order for default-server selection.
+ * time (PLAN.md section 8.2). What remains is the endpoint the server binds, the upstream groups and
+ * the server list in configuration order, which is also the tie-breaker order for default-server
+ * selection.
  */
 public final class HttpBlock {
 
     private final ListenEndpoint listen;
+    private final List<UpstreamBlock> upstreams;
+    private final Map<String, UpstreamBlock> upstreamsByName;
     private final List<ServerBlock> servers;
 
+    /**
+     * Builds an http block without upstream groups, the M0-M2 shape used by the command line and by
+     * tests that do not exercise proxying.
+     */
     public HttpBlock(ListenEndpoint listen, List<ServerBlock> servers) {
+        this(listen, Collections.<UpstreamBlock>emptyList(), servers);
+    }
+
+    public HttpBlock(ListenEndpoint listen, List<UpstreamBlock> upstreams,
+            List<ServerBlock> servers) {
         this.listen = listen;
+        this.upstreams = Collections.unmodifiableList(new ArrayList<UpstreamBlock>(upstreams));
+        Map<String, UpstreamBlock> lookup = new LinkedHashMap<String, UpstreamBlock>();
+        for (UpstreamBlock upstream : upstreams) {
+            lookup.put(upstream.name(), upstream);
+        }
+        this.upstreamsByName = Collections.unmodifiableMap(lookup);
         this.servers = Collections.unmodifiableList(new ArrayList<ServerBlock>(servers));
     }
 
@@ -29,6 +50,21 @@ public final class HttpBlock {
 
     public List<ServerBlock> servers() {
         return servers;
+    }
+
+    /** @return the declared upstream groups in configuration order */
+    public List<UpstreamBlock> upstreams() {
+        return upstreams;
+    }
+
+    /**
+     * Looks up an upstream group by name.
+     *
+     * @param name upstream name as written in {@code proxy_pass http://NAME}
+     * @return the group, or {@code null} when no such upstream was declared
+     */
+    public UpstreamBlock upstream(String name) {
+        return upstreamsByName.get(name);
     }
 
     /**
