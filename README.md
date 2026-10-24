@@ -4,8 +4,6 @@ Java + Netty 实现的轻量级 nginx：**静态文件服务 + 反向代理 + �
 
 目标不是完整复刻 nginx，而是用 Java 把最常用的一条链路做扎实：静态文件、配置路由、流式反向代理，以及一套严格的 `nginx.conf` 子集解析。
 
-> 当前状态：M0–M3 已完成（静态文件、配置与路由、反向代理）。上游连接池、失败重试、健康检查、TLS 等仍在后续里程碑中，见 [PLAN.md](./PLAN.md)。
-
 ## 能力
 
 - **静态文件**：GET/HEAD、`index`、`autoindex`、目录 301、Range（206/416）、ETag / Last-Modified / If-* 条件请求、零拷贝发送、keep-alive。
@@ -78,7 +76,7 @@ java -jar target/nginx4j-0.1.0-SNAPSHOT.jar -c nginx.conf
 
 ## 支持的配置子集
 
-表外指令一律报错，并指出所属里程碑。
+表外指令一律报错，并指出 `文件:行:列`。
 
 | 上下文 | 指令 |
 |---|---|
@@ -97,19 +95,20 @@ java -jar target/nginx4j-0.1.0-SNAPSHOT.jar -c nginx.conf
 mvn -B test
 ```
 
-当前用例覆盖静态文件语义、`nginx.conf` 解析与路由、反向代理的流式转发、SSE、头清洗、502/504、加权轮询、连接计数等。默认跳过 1 个可选的 256MB 慢读背压 soak；跑法和验收记录见 [PLAN.md](./PLAN.md) 第 7 节。
+当前用例覆盖静态文件语义、`nginx.conf` 解析与路由、反向代理的流式转发、SSE、头清洗、502/504、加权轮询和连接计数等。
 
-## 当前边界
+## 限制
 
-- **上游连接**：M3 一请求一条连接、响应结束即关；连接池、`proxy_http_version`、失败重试、健康检查、`least_conn` / `ip_hash`、draining 属于 M4。
-- **TLS/SNI、gzip、`limit_req`、`access_log`、WebSocket**：属于 M5。
-- **`rewrite` / `map` / `proxy_cache`、HTTP/2、带 URI 的 `proxy_pass`、`alias`、`try_files`、变量、多监听端口**：属于 P2 或尚未支持。
-- **定位**：轻量实现，目标是覆盖常用链路，而不是复刻 nginx 的全部功能。
+- 上游连接一请求一条、响应结束即关，暂不支持连接池和 `proxy_http_version`。
+- 暂不支持失败重试、被动健康检查、`least_conn` / `ip_hash`、draining。
+- 暂不支持 TLS/SNI、HTTP/2、gzip、`limit_req`、`access_log`、WebSocket。
+- 暂不支持 `rewrite` / `map` / `proxy_cache`、带 URI 的 `proxy_pass`、`alias`、`try_files`、变量、多监听端口。
+- 定位：轻量实现，目标是覆盖常用链路，而不是复刻 nginx 的全部功能。
 
-## 文档
+## 开发文档
 
-- [PLAN.md](./PLAN.md)：里程碑、设计决策、验收记录、已知坑。
-- [Agent.md](./Agent.md)：技术栈与工程硬约束。
+- [PLAN.md](./PLAN.md)：设计与实现细节。
+- [Agent.md](./Agent.md)：技术栈与工程约束。
 
 ## 许可证
 
